@@ -1,0 +1,188 @@
+# PDF Knowledge Extractor Configuration Template
+# Copy this file to config.yaml and customize as needed
+
+# PDF Analysis Settings - Core functionality from pdf_analyzer.py
+analysis:
+  # Maximum file size in MB for normal processing
+  max_size_mb: 10.0
+  
+  # Maximum page count for normal processing
+  max_pages: 100
+  
+  # Text extraction settings
+  extract_text_for_processable: false
+  extract_text_for_special: false
+
+# PDF Extraction Settings
+extractor:
+  # PDF parsing engine to use (default: auto)
+  # Options: auto, pypdf2, pdfplumber
+  engine: auto
+  
+  # Whether to extract images from PDFs
+  extract_images: false
+  
+  # Whether to preserve formatting
+  preserve_formatting: true
+  
+  # OCR settings for scanned PDFs
+  ocr:
+    enabled: false
+    language: eng
+    confidence_threshold: 60
+
+# Progress and Resume Settings
+progress:
+  # Enable progress bar (requires tqdm)
+  enabled: true
+  
+  # Resume capability settings
+  resume:
+    enabled: true
+    # Resume file will be created automatically in output directory
+    file_name: ".pdf_analysis_resume.json"
+    
+    # Save resume state every N files
+    save_interval: 10
+
+# Text Processing Settings
+processor:
+  # Remove special characters and symbols
+  remove_special_chars: false
+  
+  # Convert text to lowercase
+  convert_to_lowercase: false
+  
+  # Remove extra whitespace
+  normalize_whitespace: true
+  
+  # Text chunking settings
+  chunking:
+    chunk_size: 1000
+    overlap: 100
+    strategy: sentence  # Options: character, word, sentence, paragraph
+  
+  # Language processing
+  language: en
+  
+  # Stop words removal
+  remove_stop_words: false
+
+# Knowledge Analysis Settings
+analyzer:
+  # Maximum number of topics to extract
+  max_topics: 10
+  
+  # Topic modeling settings
+  topic_modeling:
+    enabled: true
+    algorithm: lda  # Options: lda, nmf
+    num_topics: 5
+    
+  # Named entity recognition
+  entity_recognition:
+    enabled: false
+    types:
+      - PERSON
+      - ORG
+      - GPE
+      - MONEY
+      - DATE
+      
+  # Sentiment analysis
+  sentiment_analysis:
+    enabled: false
+    model: vader  # Options: vader, textblob
+    
+  # Keyword extraction
+  keyword_extraction:
+    enabled: true
+    max_keywords: 20
+    algorithm: tfidf  # Options: tfidf, yake, textrank
+    
+  # Text summarization
+  summarization:
+    enabled: false
+    max_length: 300
+    algorithm: extractive  # Options: extractive, abstractive
+
+# Output Settings
+output:
+  # Output format for results
+  format: json  # Options: json, csv, yaml, txt
+  
+  # Include metadata in output
+  include_metadata: true
+  
+  # Include confidence scores
+  include_confidence: false
+  
+  # Pretty print JSON output
+  pretty_print: true
+  
+  # Save intermediate results
+  save_intermediate: false
+
+# Logging Settings
+logging:
+  # Logging level
+  level: INFO  # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  
+  # Log file path (optional)
+  file: null
+  
+  # Log format
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # Enable console logging
+  console: true
+
+# Performance Settings
+performance:
+  # Number of worker processes for parallel processing
+  num_workers: 1
+  
+  # Memory usage limit (MB)
+  memory_limit: 1024
+  
+  # Processing timeout (seconds)
+  timeout: 300
+  
+  # Enable caching
+  enable_cache: false
+  
+  # Cache directory
+  cache_dir: .cache
+
+# Claude Integration Settings
+claude:
+  # Context window management
+  max_tokens_per_request: 8000
+  context_window_size: 200000
+  
+  # Batch processing
+  batch_size: 5
+  
+  # Retry logic
+  max_retries: 3
+  retry_delay_base: 2.0  # seconds (exponential backoff)
+  
+  # Output formatting
+  output_format: markdown
+  include_metadata: true
+  include_cross_references: true
+
+# Advanced Settings
+advanced:
+  # Custom preprocessing pipeline
+  preprocessing_pipeline: []
+  
+  # Custom feature extractors
+  feature_extractors: []
+  
+  # Model configurations
+  models:
+    # Custom model paths
+    topic_model: null
+    entity_model: null
+    sentiment_model: null

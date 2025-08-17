@@ -1,0 +1,30 @@
+# Core dependencies
+PyPDF2>=3.0.0
+pdfplumber>=0.7.0
+pyyaml>=6.0
+
+# Progress tracking and UI
+tqdm>=4.64.0
+
+# Text processing
+nltk>=3.8
+spacy>=3.4.0
+scikit-learn>=1.1.0
+
+# Data handling
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=22.0.0
+flake8>=5.0.0
+mypy>=0.990
+
+# Optional dependencies for advanced features
+# Uncomment as needed:
+# transformers>=4.20.0  # For advanced NLP
+# torch>=1.12.0  # For deep learning models
+# matplotlib>=3.5.0  # For visualization
+# wordcloud>=1.9.0  # For word clouds
