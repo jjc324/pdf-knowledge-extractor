@@ -831,65 +831,53 @@ Please provide:
 
 Please format your response in clear markdown with appropriate headers. Focus on extracting valuable knowledge and insights rather than just summarizing content."""
 
-            # Try multiple Claude CLI command patterns with improved error handling
-            claude_commands = [
-                ['claude', 'code', '--prompt', prompt, '--file', temp_file_path],
-                ['claude', '--prompt', prompt, '--file', temp_file_path],
-                ['claude-cli', '--prompt', prompt, '--file', temp_file_path],
-            ]
-            
+            # Use Claude CLI with stdin approach (correct syntax)
             claude_response = None
             last_error = None
             
-            for cmd in claude_commands:
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=self.claude_timeout,
-                        check=False  # Don't raise on non-zero exit
-                    )
+            # Primary approach: stdin-based Claude CLI
+            try:
+                full_input = f"{prompt}\n\n{cleaned_text}"
+                result = subprocess.run(
+                    ['claude'],
+                    input=full_input,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.claude_timeout,
+                    check=False
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    claude_response = result.stdout.strip()
+                else:
+                    # Categorize the error for better handling
+                    error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                    claude_error = self.categorize_claude_error(error_msg, result.returncode)
+                    last_error = claude_error
+                    logger.debug(f"Claude CLI failed: {claude_error.error_type.value} - {error_msg}")
                     
-                    if result.returncode == 0 and result.stdout.strip():
-                        claude_response = result.stdout.strip()
-                        break
-                    else:
-                        # Categorize the error for better handling
-                        error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                        claude_error = self.categorize_claude_error(error_msg, result.returncode)
-                        last_error = claude_error
-                        
-                        logger.debug(f"Command {' '.join(cmd)} failed: {claude_error.error_type.value} - {error_msg}")
-                        
-                        # Don't try alternatives for certain error types
-                        if claude_error.error_type in [ClaudeErrorType.CLI_NOT_FOUND, ClaudeErrorType.CLI_AUTH_ERROR]:
-                            break
-                        
-                except subprocess.TimeoutExpired:
-                    last_error = ClaudeError(
-                        error_type=ClaudeErrorType.TIMEOUT,
-                        message=f"Command timed out after {self.claude_timeout}s",
-                        is_retryable=True
-                    )
-                    logger.debug(f"Command {' '.join(cmd)} timed out")
-                    continue
-                    
-                except FileNotFoundError:
-                    last_error = ClaudeError(
-                        error_type=ClaudeErrorType.CLI_NOT_FOUND,
-                        message="Claude CLI not found",
-                        is_retryable=False
-                    )
-                    logger.debug(f"Command {' '.join(cmd)} not found")
-                    continue
+            except subprocess.TimeoutExpired:
+                last_error = ClaudeError(
+                    error_type=ClaudeErrorType.TIMEOUT,
+                    message=f"Command timed out after {self.claude_timeout}s",
+                    is_retryable=True
+                )
+                logger.debug(f"Claude CLI timed out")
+                
+            except FileNotFoundError:
+                last_error = ClaudeError(
+                    error_type=ClaudeErrorType.CLI_NOT_FOUND,
+                    message="Claude CLI not found",
+                    is_retryable=False
+                )
+                logger.debug(f"Claude CLI not found")
             
-            # Final fallback: stdin approach
+            # Fallback: try 'claude code' command with stdin
             if not claude_response and last_error and last_error.error_type != ClaudeErrorType.CLI_NOT_FOUND:
                 try:
                     full_input = f"{prompt}\n\n{cleaned_text}"
                     result = subprocess.run(
-                        ['claude'],
+                        ['claude', 'code'],
                         input=full_input,
                         capture_output=True,
                         text=True,
@@ -902,12 +890,19 @@ Please format your response in clear markdown with appropriate headers. Focus on
                     else:
                         error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
                         last_error = self.categorize_claude_error(error_msg, result.returncode)
+                        logger.debug(f"Claude Code CLI failed: {error_msg}")
                         
-                except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                except subprocess.TimeoutExpired:
                     last_error = ClaudeError(
-                        error_type=ClaudeErrorType.CLI_NOT_FOUND if isinstance(e, FileNotFoundError) else ClaudeErrorType.TIMEOUT,
-                        message=str(e),
-                        is_retryable=False if isinstance(e, FileNotFoundError) else True
+                        error_type=ClaudeErrorType.TIMEOUT,
+                        message=f"Claude Code command timed out after {self.claude_timeout}s",
+                        is_retryable=True
+                    )
+                except FileNotFoundError:
+                    last_error = ClaudeError(
+                        error_type=ClaudeErrorType.CLI_NOT_FOUND,
+                        message="Claude Code CLI not found",
+                        is_retryable=False
                     )
             
             if not claude_response:
