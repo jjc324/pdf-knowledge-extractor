@@ -177,3 +177,12 @@ logs/
 .Trashes
 ehthumbs.db
 Thumbs.db
+# Analysis results
+*_insights/
+*_results/
+*_analysis/
+test_*/
+batch*.md
+*_summary.md
+processing_summary.md
+
