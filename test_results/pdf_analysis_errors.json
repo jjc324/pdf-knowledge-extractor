@@ -1,0 +1,8 @@
+[
+  {
+    "path": "/Users/jjc324/Desktop/5. Inbox/Mao Tse-tung on Guerrilla Warfare.pdf",
+    "filename": "Mao Tse-tung on Guerrilla Warfare.pdf",
+    "error": "Failed to read PDF: PyCryptodome is required for AES algorithm",
+    "error_type": "Exception"
+  }
+]

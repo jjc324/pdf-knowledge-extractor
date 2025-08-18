@@ -343,8 +343,24 @@ class TestClaudeIntegration(unittest.TestCase):
         self.assertIn(claude_response, formatted_output)
         self.assertIn("## Related Documents", formatted_output)
     
-    def test_simulate_claude_processing(self):
-        """Test Claude processing simulation."""
+    @patch('subprocess.run')
+    def test_claude_processing(self, mock_subprocess):
+        """Test Claude processing with mocked subprocess."""
+        # Mock successful Claude CLI response
+        mock_result = Mock()
+        mock_result.stdout = """## Executive Summary
+This is a test document analysis.
+
+## Key Insights
+- Important insight 1
+- Important insight 2
+
+## Main Themes
+The document covers testing themes.
+"""
+        mock_result.returncode = 0
+        mock_subprocess.return_value = mock_result
+        
         claude_integration = ClaudeIntegration()
         
         file_path = "test.pdf"
@@ -358,18 +374,28 @@ class TestClaudeIntegration(unittest.TestCase):
         )
         
         text = "This is sample text content for processing."
-        response = claude_integration.simulate_claude_processing(text, file_path)
+        response = claude_integration.claude_processing(text, file_path)
         
         # Check response structure
         self.assertIsInstance(response, str)
+        self.assertIn("Executive Summary", response)
+        self.assertIn("Key Insights", response)
+        self.assertIn("Processing Metadata", response)
         self.assertIn("test.pdf", response)
-        self.assertIn("Key Analysis Points", response)
-        self.assertIn("Summary", response)
-        self.assertIn("Technical Details", response)
+        
+        # Verify subprocess was called
+        mock_subprocess.assert_called()
     
+    @patch('subprocess.run')
     @patch('src.pdf_knowledge_extractor.claude_integration.PDFExtractor')
-    def test_process_document_with_retry_success(self, mock_extractor_class):
+    def test_process_document_with_retry_success(self, mock_extractor_class, mock_subprocess):
         """Test successful document processing."""
+        # Mock Claude CLI response
+        mock_result = Mock()
+        mock_result.stdout = "Test analysis from Claude CLI"
+        mock_result.returncode = 0
+        mock_subprocess.return_value = mock_result
+        
         mock_extractor = Mock()
         mock_extractor.extract_text.return_value = "Sample document text content."
         mock_extractor_class.return_value = mock_extractor
@@ -392,6 +418,7 @@ class TestClaudeIntegration(unittest.TestCase):
         self.assertTrue(success)
         self.assertIsInstance(response, str)
         self.assertGreater(len(response), 0)
+        self.assertIn("Test analysis from Claude CLI", response)
         
         # Check context was updated
         context = claude_integration.document_contexts[file_path]

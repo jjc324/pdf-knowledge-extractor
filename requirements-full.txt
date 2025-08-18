@@ -1,0 +1,17 @@
+# Full dependencies including advanced NLP features
+# Install with: pip install -r requirements-full.txt
+
+# Include all core dependencies
+-r requirements-core.txt
+
+# Advanced NLP dependencies
+spacy>=3.4.0
+scikit-learn>=1.1.0
+
+# Optional advanced features
+transformers>=4.20.0  # For advanced NLP models
+torch>=1.12.0  # For deep learning models (CPU version)
+matplotlib>=3.5.0  # For visualization
+wordcloud>=1.9.0  # For word clouds
+
+# Note: After installing spacy, run: python -m spacy download en_core_web_sm

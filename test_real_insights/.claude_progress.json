@@ -1,0 +1,11 @@
+{
+  "total_documents": 2,
+  "processed_documents": 2,
+  "failed_documents": 0,
+  "skipped_documents": 0,
+  "current_batch": 2,
+  "total_batches": 2,
+  "start_time": "2025-08-17T17:37:29.807777",
+  "last_update": "2025-08-17T17:38:20.065034",
+  "estimated_completion": "2025-08-17T17:38:20.065043"
+}

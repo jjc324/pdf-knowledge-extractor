@@ -1,0 +1,24 @@
+# Core dependencies for basic PDF processing
+# Install with: pip install -r requirements-core.txt
+
+# Core PDF processing
+PyPDF2>=3.0.0
+pdfplumber>=0.7.0
+pyyaml>=6.0
+
+# Progress tracking and UI
+tqdm>=4.64.0
+
+# Basic text processing (without spaCy)
+nltk>=3.8
+
+# Data handling
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=22.0.0
+flake8>=5.0.0
+mypy>=0.990

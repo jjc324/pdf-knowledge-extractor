@@ -36,6 +36,27 @@ class ProcessingStatus(Enum):
     SKIPPED = "skipped"
 
 
+class ClaudeErrorType(Enum):
+    """Types of Claude CLI errors for better categorization."""
+    RATE_LIMIT = "rate_limit"
+    TIMEOUT = "timeout"
+    CONTENT_TOO_LARGE = "content_too_large"
+    INVALID_CONTENT = "invalid_content"
+    CLI_NOT_FOUND = "cli_not_found"
+    CLI_AUTH_ERROR = "cli_auth_error"
+    NETWORK_ERROR = "network_error"
+    UNKNOWN_ERROR = "unknown_error"
+
+
+@dataclass
+class ClaudeError:
+    """Claude error information."""
+    error_type: ClaudeErrorType
+    message: str
+    retry_after: Optional[int] = None  # seconds to wait before retry
+    is_retryable: bool = True
+
+
 @dataclass
 class DocumentContext:
     """Context information for a document being processed."""
@@ -49,14 +70,19 @@ class DocumentContext:
     processing_status: ProcessingStatus = ProcessingStatus.PENDING
     retry_count: int = 0
     last_error: Optional[str] = None
+    last_error_type: Optional[ClaudeErrorType] = None
     processing_start: Optional[str] = None
     processing_end: Optional[str] = None
     claude_response_length: int = 0
     related_documents: List[str] = None
+    retry_delays: List[float] = None  # Track actual delays used
+    content_filtered: bool = False  # Whether content was pre-filtered
     
     def __post_init__(self):
         if self.related_documents is None:
             self.related_documents = []
+        if self.retry_delays is None:
+            self.retry_delays = []
 
 
 @dataclass 
@@ -71,12 +97,23 @@ class BatchProgress:
     start_time: str
     last_update: str
     estimated_completion: Optional[str] = None
+    claude_health_status: str = "unknown"  # healthy, degraded, unhealthy
+    consecutive_failures: int = 0
+    rate_limit_hits: int = 0
     
     @property
     def completion_percentage(self) -> float:
         if self.total_documents == 0:
             return 0.0
         return (self.processed_documents / self.total_documents) * 100
+    
+    @property
+    def success_rate(self) -> float:
+        """Current success rate percentage."""
+        total_attempted = self.processed_documents + self.failed_documents
+        if total_attempted == 0:
+            return 0.0
+        return (self.processed_documents / total_attempted) * 100
 
 
 class ClaudeIntegration:
@@ -105,8 +142,19 @@ class ClaudeIntegration:
         self.max_tokens_per_request = claude_config.get('max_tokens_per_request', 8000)
         self.context_window_size = claude_config.get('context_window_size', 200000)
         self.max_retries = claude_config.get('max_retries', 3)
-        self.retry_delay_base = claude_config.get('retry_delay_base', 2.0)
+        self.retry_delay_base = claude_config.get('retry_delay_base', 1.0)
+        self.retry_delay_max = claude_config.get('retry_delay_max', 30.0)
         self.batch_size = claude_config.get('batch_size', 5)
+        self.claude_timeout = claude_config.get('timeout', 120)
+        
+        # Content filtering configuration
+        self.max_content_length = claude_config.get('max_content_length', 500000)  # ~125k tokens
+        self.min_content_quality_ratio = claude_config.get('min_content_quality_ratio', 0.7)
+        
+        # Reliability features
+        self.skip_failed = claude_config.get('skip_failed', False)
+        self.health_check_enabled = claude_config.get('health_check_enabled', True)
+        self.rate_limit_backoff_multiplier = claude_config.get('rate_limit_backoff_multiplier', 2.0)
         
         # Output formatting
         output_config = self.config.get('output', {})
@@ -220,6 +268,244 @@ class ClaudeIntegration:
         """
         # Rough estimation: ~4 characters per token for English text
         return len(text) // 4
+    
+    def categorize_claude_error(self, error_msg: str, return_code: int) -> ClaudeError:
+        """Categorize Claude CLI error for appropriate handling.
+        
+        Args:
+            error_msg: Error message from Claude CLI
+            return_code: Process return code
+            
+        Returns:
+            ClaudeError with categorization and retry strategy
+        """
+        error_msg_lower = error_msg.lower()
+        
+        # Rate limiting
+        if "rate limit" in error_msg_lower or "too many requests" in error_msg_lower:
+            return ClaudeError(
+                error_type=ClaudeErrorType.RATE_LIMIT,
+                message=error_msg,
+                retry_after=60,  # Wait 1 minute for rate limits
+                is_retryable=True
+            )
+        
+        # Timeout errors
+        if "timeout" in error_msg_lower or return_code == 124:
+            return ClaudeError(
+                error_type=ClaudeErrorType.TIMEOUT,
+                message=error_msg,
+                retry_after=5,
+                is_retryable=True
+            )
+        
+        # Content size issues
+        if "too large" in error_msg_lower or "content length" in error_msg_lower:
+            return ClaudeError(
+                error_type=ClaudeErrorType.CONTENT_TOO_LARGE,
+                message=error_msg,
+                is_retryable=False  # Don't retry without content filtering
+            )
+        
+        # Authentication issues
+        if "auth" in error_msg_lower or "unauthorized" in error_msg_lower or return_code == 401:
+            return ClaudeError(
+                error_type=ClaudeErrorType.CLI_AUTH_ERROR,
+                message=error_msg,
+                is_retryable=False
+            )
+        
+        # CLI not found
+        if "command not found" in error_msg_lower or "no such file" in error_msg_lower or return_code == 127:
+            return ClaudeError(
+                error_type=ClaudeErrorType.CLI_NOT_FOUND,
+                message=error_msg,
+                is_retryable=False
+            )
+        
+        # Network issues
+        if "network" in error_msg_lower or "connection" in error_msg_lower:
+            return ClaudeError(
+                error_type=ClaudeErrorType.NETWORK_ERROR,
+                message=error_msg,
+                retry_after=10,
+                is_retryable=True
+            )
+        
+        # Content issues
+        if "invalid" in error_msg_lower or "malformed" in error_msg_lower:
+            return ClaudeError(
+                error_type=ClaudeErrorType.INVALID_CONTENT,
+                message=error_msg,
+                is_retryable=False
+            )
+        
+        # Default to unknown error
+        return ClaudeError(
+            error_type=ClaudeErrorType.UNKNOWN_ERROR,
+            message=error_msg,
+            retry_after=5,
+            is_retryable=True
+        )
+    
+    def calculate_exponential_backoff(self, attempt: int, error_type: ClaudeErrorType, 
+                                    base_delay: Optional[float] = None) -> float:
+        """Calculate exponential backoff delay with jitter.
+        
+        Args:
+            attempt: Current attempt number (0-based)
+            error_type: Type of error encountered
+            base_delay: Override base delay
+            
+        Returns:
+            Delay in seconds
+        """
+        if base_delay is None:
+            base_delay = self.retry_delay_base
+        
+        # Different base delays for different error types
+        if error_type == ClaudeErrorType.RATE_LIMIT:
+            base_delay = max(base_delay, 2.0) * self.rate_limit_backoff_multiplier
+        elif error_type == ClaudeErrorType.NETWORK_ERROR:
+            base_delay = max(base_delay, 1.0)
+        
+        # Exponential backoff with jitter
+        import random
+        delay = min(base_delay * (2 ** attempt), self.retry_delay_max)
+        jitter = random.uniform(0.1, 0.3) * delay  # 10-30% jitter
+        
+        return delay + jitter
+    
+    def test_claude_cli_health(self) -> Tuple[bool, str]:
+        """Test Claude CLI availability and basic functionality.
+        
+        Returns:
+            Tuple of (is_healthy, status_message)
+        """
+        if not self.health_check_enabled:
+            return True, "Health check disabled"
+        
+        import subprocess
+        
+        try:
+            # Test basic Claude CLI availability
+            result = subprocess.run(
+                ['claude', '--version'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False
+            )
+            
+            if result.returncode == 0:
+                return True, f"Claude CLI healthy: {result.stdout.strip()}"
+            elif result.returncode == 127:
+                return False, "Claude CLI not found in PATH"
+            else:
+                return False, f"Claude CLI error: {result.stderr.strip()}"
+                
+        except subprocess.TimeoutExpired:
+            return False, "Claude CLI health check timed out"
+        except FileNotFoundError:
+            return False, "Claude CLI executable not found"
+        except Exception as e:
+            return False, f"Health check failed: {e}"
+    
+    def clean_text_for_claude(self, text: str) -> str:
+        """Clean and prepare text for Claude processing.
+        
+        Args:
+            text: Raw text to clean
+            
+        Returns:
+            Cleaned text
+        """
+        if not text:
+            return text
+        
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove control characters but keep newlines and tabs
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        
+        # Normalize unicode
+        import unicodedata
+        text = unicodedata.normalize('NFKC', text)
+        
+        # Remove very long repeated patterns that might confuse Claude
+        text = re.sub(r'(.{10,}?)\1{3,}', r'\1\1', text)
+        
+        return text.strip()
+    
+    def validate_text_quality(self, text: str) -> Tuple[bool, str]:
+        """Validate text quality for Claude processing.
+        
+        Args:
+            text: Text to validate
+            
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        if not text or not text.strip():
+            return False, "Empty or whitespace-only text"
+        
+        # Check length limits
+        if len(text) > self.max_content_length:
+            return False, f"Text too long: {len(text)} > {self.max_content_length}"
+        
+        # Check for reasonable text quality
+        alphanumeric_chars = sum(1 for c in text if c.isalnum())
+        total_chars = len(text)
+        
+        if total_chars > 0:
+            quality_ratio = alphanumeric_chars / total_chars
+            if quality_ratio < self.min_content_quality_ratio:
+                return False, f"Poor text quality: {quality_ratio:.2f} < {self.min_content_quality_ratio}"
+        
+        # Check for excessive repetition
+        words = text.split()
+        if len(words) > 100:  # Only check for longer texts
+            unique_words = len(set(words))
+            if unique_words / len(words) < 0.1:  # Less than 10% unique words
+                return False, "Excessive repetition detected"
+        
+        return True, "Text quality acceptable"
+    
+    def should_filter_document(self, context: DocumentContext, text: str) -> Tuple[bool, str]:
+        """Determine if document should be filtered before Claude processing.
+        
+        Args:
+            context: Document context
+            text: Document text
+            
+        Returns:
+            Tuple of (should_filter, reason)
+        """
+        # Check if already filtered
+        if context.content_filtered:
+            return False, "Already filtered"
+        
+        # Very large documents
+        if context.size_mb > 50:  # 50MB+ files
+            return True, "File too large (>50MB)"
+        
+        # Too many pages (likely scanned documents with poor text extraction)
+        if context.page_count > 500:
+            return True, "Too many pages (>500)"
+        
+        # Poor text extraction ratio
+        expected_chars_per_page = 2000  # Rough estimate
+        expected_total = context.page_count * expected_chars_per_page
+        if expected_total > 0 and len(text) < (expected_total * 0.1):
+            return True, "Poor text extraction ratio"
+        
+        # Text quality issues
+        is_valid, reason = self.validate_text_quality(text)
+        if not is_valid:
+            return True, f"Text quality issue: {reason}"
+        
+        return False, "Document passes filtering"
     
     def should_chunk_document(self, context: DocumentContext) -> bool:
         """Determine if document should be chunked based on size.
@@ -487,52 +773,174 @@ class ClaudeIntegration:
         
         return "\n".join(output_lines)
     
-    def simulate_claude_processing(self, text: str, file_path: str) -> str:
-        """Simulate Claude processing (placeholder for actual Claude API integration).
+    def claude_processing(self, text: str, file_path: str) -> str:
+        """Process document text using Claude Code CLI for real insights.
         
         Args:
             text: Text to process
             file_path: Path to the source file
             
         Returns:
-            Simulated Claude response
+            Claude analysis response
+            
+        Raises:
+            Exception: If Claude processing fails after all retries
         """
-        # This is a placeholder - in real implementation, this would call Claude API
+        import subprocess
+        import tempfile
+        import os
+        
         context = self.document_contexts.get(file_path)
         filename = context.filename if context else Path(file_path).name
         
-        # Simulate processing delay
-        time.sleep(0.1)
+        # Pre-filter and clean text
+        cleaned_text = self.clean_text_for_claude(text)
         
-        # Generate simulated analysis
-        word_count = len(text.split())
-        char_count = len(text)
+        # Validate text quality
+        is_valid, reason = self.validate_text_quality(cleaned_text)
+        if not is_valid:
+            raise Exception(f"Text validation failed: {reason}")
         
-        response = f"""This document ({filename}) contains approximately {word_count:,} words and {char_count:,} characters.
-
-**Key Analysis Points:**
-- Document type: PDF analysis
-- Content length: {'Long' if word_count > 5000 else 'Medium' if word_count > 1000 else 'Short'}
-- Processing complexity: {'High' if char_count > 50000 else 'Medium' if char_count > 10000 else 'Low'}
-
-**Summary:**
-This is a simulated analysis of the document. In a real implementation, this would contain:
-- Detailed content analysis
-- Key insights and findings
-- Important concepts and themes
-- Actionable recommendations
-
-**Technical Details:**
-- Estimated tokens: {self.estimate_tokens(text):,}
-- Processing timestamp: {datetime.now().isoformat()}
-- Analysis confidence: High (simulated)
-
-*Note: This is a placeholder response for development and testing purposes.*"""
+        # Create a temporary file with the document text
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
+            temp_file.write(f"Document: {filename}\n")
+            temp_file.write(f"Source: {file_path}\n")
+            temp_file.write("=" * 80 + "\n\n")
+            temp_file.write(cleaned_text)
+            temp_file_path = temp_file.name
         
-        return response
+        try:
+            # Craft a comprehensive prompt for Claude
+            prompt = f"""Please analyze this document and provide comprehensive insights. The document is from a PDF extraction process.
+
+Please provide:
+
+1. **Executive Summary**: A concise overview of the main purpose and key points of this document.
+
+2. **Key Insights**: The most important insights, concepts, or findings from this document. Focus on actionable information and unique perspectives.
+
+3. **Main Themes**: Identify and explain the primary themes or topics covered.
+
+4. **Notable Quotes or Concepts**: Highlight any particularly insightful quotes, frameworks, or concepts that stand out.
+
+5. **Practical Applications**: How can the insights from this document be applied in real-world scenarios?
+
+6. **Connections**: What broader topics, fields, or other knowledge areas does this document connect to?
+
+7. **Questions for Further Exploration**: What questions does this document raise that would be worth investigating further?
+
+Please format your response in clear markdown with appropriate headers. Focus on extracting valuable knowledge and insights rather than just summarizing content."""
+
+            # Try multiple Claude CLI command patterns with improved error handling
+            claude_commands = [
+                ['claude', 'code', '--prompt', prompt, '--file', temp_file_path],
+                ['claude', '--prompt', prompt, '--file', temp_file_path],
+                ['claude-cli', '--prompt', prompt, '--file', temp_file_path],
+            ]
+            
+            claude_response = None
+            last_error = None
+            
+            for cmd in claude_commands:
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=self.claude_timeout,
+                        check=False  # Don't raise on non-zero exit
+                    )
+                    
+                    if result.returncode == 0 and result.stdout.strip():
+                        claude_response = result.stdout.strip()
+                        break
+                    else:
+                        # Categorize the error for better handling
+                        error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                        claude_error = self.categorize_claude_error(error_msg, result.returncode)
+                        last_error = claude_error
+                        
+                        logger.debug(f"Command {' '.join(cmd)} failed: {claude_error.error_type.value} - {error_msg}")
+                        
+                        # Don't try alternatives for certain error types
+                        if claude_error.error_type in [ClaudeErrorType.CLI_NOT_FOUND, ClaudeErrorType.CLI_AUTH_ERROR]:
+                            break
+                        
+                except subprocess.TimeoutExpired:
+                    last_error = ClaudeError(
+                        error_type=ClaudeErrorType.TIMEOUT,
+                        message=f"Command timed out after {self.claude_timeout}s",
+                        is_retryable=True
+                    )
+                    logger.debug(f"Command {' '.join(cmd)} timed out")
+                    continue
+                    
+                except FileNotFoundError:
+                    last_error = ClaudeError(
+                        error_type=ClaudeErrorType.CLI_NOT_FOUND,
+                        message="Claude CLI not found",
+                        is_retryable=False
+                    )
+                    logger.debug(f"Command {' '.join(cmd)} not found")
+                    continue
+            
+            # Final fallback: stdin approach
+            if not claude_response and last_error and last_error.error_type != ClaudeErrorType.CLI_NOT_FOUND:
+                try:
+                    full_input = f"{prompt}\n\n{cleaned_text}"
+                    result = subprocess.run(
+                        ['claude'],
+                        input=full_input,
+                        capture_output=True,
+                        text=True,
+                        timeout=self.claude_timeout,
+                        check=False
+                    )
+                    
+                    if result.returncode == 0 and result.stdout.strip():
+                        claude_response = result.stdout.strip()
+                    else:
+                        error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                        last_error = self.categorize_claude_error(error_msg, result.returncode)
+                        
+                except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                    last_error = ClaudeError(
+                        error_type=ClaudeErrorType.CLI_NOT_FOUND if isinstance(e, FileNotFoundError) else ClaudeErrorType.TIMEOUT,
+                        message=str(e),
+                        is_retryable=False if isinstance(e, FileNotFoundError) else True
+                    )
+            
+            if not claude_response:
+                error_msg = f"Claude processing failed: {last_error.message if last_error else 'Unknown error'}"
+                raise Exception(error_msg)
+                
+            # Add metadata to the response
+            word_count = len(text.split())
+            char_count = len(text)
+            
+            enhanced_response = f"""{claude_response}
+
+---
+
+## Processing Metadata
+- **Document**: {filename}
+- **Word Count**: {word_count:,}
+- **Character Count**: {char_count:,}
+- **Estimated Tokens**: {self.estimate_tokens(text):,}
+- **Processing Timestamp**: {datetime.now().isoformat()}
+- **Processing Method**: Claude Code CLI"""
+
+            return enhanced_response
+            
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except OSError:
+                pass
     
     def process_document_with_retry(self, file_path: str) -> Tuple[bool, str]:
-        """Process a single document with retry logic.
+        """Process a single document with improved retry logic and error handling.
         
         Args:
             file_path: Path to the document to process
@@ -546,26 +954,49 @@ This is a simulated analysis of the document. In a real implementation, this wou
         
         context.processing_start = datetime.now().isoformat()
         context.processing_status = ProcessingStatus.IN_PROGRESS
+        context.retry_delays = []
         
+        # Extract text once before retries
+        try:
+            text = self.extractor.extract_text(file_path)
+            if not text.strip():
+                context.processing_status = ProcessingStatus.FAILED
+                context.last_error = "No text extracted from PDF"
+                context.last_error_type = ClaudeErrorType.INVALID_CONTENT
+                return False, "No text extracted from PDF"
+        except Exception as e:
+            context.processing_status = ProcessingStatus.FAILED
+            context.last_error = f"Text extraction failed: {str(e)}"
+            context.last_error_type = ClaudeErrorType.INVALID_CONTENT
+            return False, f"Text extraction failed: {str(e)}"
+        
+        # Pre-filter problematic documents
+        should_filter, filter_reason = self.should_filter_document(context, text)
+        if should_filter:
+            context.processing_status = ProcessingStatus.SKIPPED
+            context.last_error = f"Document filtered: {filter_reason}"
+            context.content_filtered = True
+            
+            if self.skip_failed:
+                logger.info(f"Skipping filtered document: {context.filename} - {filter_reason}")
+                return False, f"Document filtered and skipped: {filter_reason}"
+            else:
+                logger.warning(f"Processing filtered document anyway: {context.filename} - {filter_reason}")
+        
+        # Build keyword index for cross-referencing (once)
+        self.build_keyword_index(file_path, text)
+        
+        claude_error = None
         for attempt in range(self.max_retries + 1):
             try:
-                # Extract text
-                text = self.extractor.extract_text(file_path)
-                if not text.strip():
-                    context.processing_status = ProcessingStatus.FAILED
-                    context.last_error = "No text extracted from PDF"
-                    return False, "No text extracted from PDF"
+                # Process with Claude
+                claude_response = self.claude_processing(text, file_path)
                 
-                # Build keyword index for cross-referencing
-                self.build_keyword_index(file_path, text)
-                
-                # Process with Claude (simulated)
-                claude_response = self.simulate_claude_processing(text, file_path)
-                
-                # Update context
+                # Update context on success
                 context.claude_response_length = len(claude_response)
                 context.processing_end = datetime.now().isoformat()
                 context.processing_status = ProcessingStatus.COMPLETED
+                context.last_error_type = None
                 
                 return True, claude_response
                 
@@ -573,22 +1004,79 @@ This is a simulated analysis of the document. In a real implementation, this wou
                 context.retry_count = attempt
                 context.last_error = str(e)
                 
+                # Try to categorize the error for better retry strategy
+                try:
+                    # Extract Claude error information if available
+                    if "Claude processing failed:" in str(e):
+                        claude_error = self.categorize_claude_error(str(e), 1)
+                    else:
+                        claude_error = self.categorize_claude_error(str(e), 1)
+                    
+                    context.last_error_type = claude_error.error_type
+                    
+                    # Check if error is retryable
+                    if not claude_error.is_retryable:
+                        logger.error(f"Non-retryable error for {context.filename}: {claude_error.error_type.value} - {e}")
+                        context.processing_status = ProcessingStatus.FAILED
+                        context.processing_end = datetime.now().isoformat()
+                        return False, f"Non-retryable error: {str(e)}"
+                    
+                except Exception:
+                    # Fallback error categorization
+                    claude_error = ClaudeError(
+                        error_type=ClaudeErrorType.UNKNOWN_ERROR,
+                        message=str(e),
+                        is_retryable=True
+                    )
+                    context.last_error_type = claude_error.error_type
+                
+                # Skip failed documents if configured
+                if self.skip_failed and claude_error.error_type in [
+                    ClaudeErrorType.CLI_NOT_FOUND, 
+                    ClaudeErrorType.CLI_AUTH_ERROR,
+                    ClaudeErrorType.CONTENT_TOO_LARGE
+                ]:
+                    logger.info(f"Skipping failed document: {context.filename} - {claude_error.error_type.value}")
+                    context.processing_status = ProcessingStatus.SKIPPED
+                    context.processing_end = datetime.now().isoformat()
+                    return False, f"Document skipped: {str(e)}"
+                
                 if attempt < self.max_retries:
-                    # Exponential backoff
-                    delay = self.retry_delay_base ** attempt
-                    logger.warning(f"Attempt {attempt + 1} failed for {context.filename}, "
-                                 f"retrying in {delay}s: {e}")
+                    # Calculate intelligent backoff delay
+                    delay = self.calculate_exponential_backoff(attempt, claude_error.error_type)
+                    
+                    # Use specific retry delay for certain errors
+                    if claude_error.retry_after:
+                        delay = max(delay, claude_error.retry_after)
+                    
+                    context.retry_delays.append(delay)
+                    
+                    logger.warning(f"Attempt {attempt + 1} failed for {context.filename} "
+                                 f"({claude_error.error_type.value}), retrying in {delay:.1f}s: {e}")
+                    
+                    # Update batch progress for rate limit tracking
+                    if self.batch_progress and claude_error.error_type == ClaudeErrorType.RATE_LIMIT:
+                        self.batch_progress.rate_limit_hits += 1
+                        self.batch_progress.claude_health_status = "degraded"
+                    
                     time.sleep(delay)
                 else:
                     logger.error(f"All retry attempts failed for {context.filename}: {e}")
                     context.processing_status = ProcessingStatus.FAILED
                     context.processing_end = datetime.now().isoformat()
+                    
+                    # Update batch progress for consecutive failures
+                    if self.batch_progress:
+                        self.batch_progress.consecutive_failures += 1
+                        if self.batch_progress.consecutive_failures >= 5:
+                            self.batch_progress.claude_health_status = "unhealthy"
+                    
                     return False, str(e)
         
         return False, "Max retries exceeded"
     
     def process_batch(self, batch: List[str], batch_number: int) -> Tuple[int, int]:
-        """Process a batch of documents.
+        """Process a batch of documents with enhanced progress tracking.
         
         Args:
             batch: List of document paths to process
@@ -599,13 +1087,37 @@ This is a simulated analysis of the document. In a real implementation, this wou
         """
         logger.info(f"Processing batch {batch_number} with {len(batch)} documents")
         
+        # Health check before starting batch
+        if self.health_check_enabled:
+            is_healthy, health_msg = self.test_claude_cli_health()
+            if not is_healthy:
+                logger.error(f"Claude CLI health check failed: {health_msg}")
+                if self.batch_progress:
+                    self.batch_progress.claude_health_status = "unhealthy"
+                
+                if self.skip_failed:
+                    logger.info("Skipping batch due to Claude CLI health issues")
+                    return 0, len(batch)
+            else:
+                logger.info(f"Claude CLI health check passed: {health_msg}")
+                if self.batch_progress:
+                    self.batch_progress.claude_health_status = "healthy"
+                    self.batch_progress.consecutive_failures = 0
+        
         successful = 0
         failed = 0
         
-        # Use tqdm if available
-        iterator = tqdm(batch, desc=f"Batch {batch_number}") if tqdm else batch
+        # Enhanced progress bar with success rate
+        if tqdm:
+            progress_bar = tqdm(
+                batch, 
+                desc=f"Batch {batch_number} (Success: 0%, Health: {getattr(self.batch_progress, 'claude_health_status', 'unknown')})",
+                unit="doc"
+            )
+        else:
+            progress_bar = batch
         
-        for file_path in iterator:
+        for i, file_path in enumerate(progress_bar):
             context = self.document_contexts.get(file_path)
             if not context:
                 failed += 1
@@ -615,6 +1127,12 @@ This is a simulated analysis of the document. In a real implementation, this wou
             
             if success:
                 successful += 1
+                
+                # Reset consecutive failures on success
+                if self.batch_progress:
+                    self.batch_progress.consecutive_failures = 0
+                    if self.batch_progress.claude_health_status == "degraded":
+                        self.batch_progress.claude_health_status = "healthy"
                 
                 # Find related documents
                 related_docs = self.find_related_documents(file_path)
@@ -630,11 +1148,35 @@ This is a simulated analysis of the document. In a real implementation, this wou
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(formatted_output)
                 
-                logger.info(f"Completed {context.filename} -> {output_filename}")
+                logger.info(f"✅ Completed {context.filename} -> {output_filename}")
                 
             else:
                 failed += 1
-                logger.error(f"Failed to process {context.filename}: {response}")
+                logger.error(f"❌ Failed to process {context.filename}: {response}")
+            
+            # Update progress bar with real-time stats
+            if tqdm and isinstance(progress_bar, tqdm):
+                total_processed = successful + failed
+                success_rate = (successful / total_processed * 100) if total_processed > 0 else 0
+                health_status = getattr(self.batch_progress, 'claude_health_status', 'unknown')
+                
+                progress_bar.set_description(
+                    f"Batch {batch_number} (Success: {success_rate:.1f}%, Health: {health_status})"
+                )
+                
+                # Add success/failure counts to postfix
+                progress_bar.set_postfix({
+                    'success': successful,
+                    'failed': failed,
+                    'rate_limits': getattr(self.batch_progress, 'rate_limit_hits', 0)
+                })
+            
+            # Log progress every 10 documents
+            if (successful + failed) % 10 == 0:
+                total_processed = successful + failed
+                success_rate = (successful / total_processed * 100) if total_processed > 0 else 0
+                logger.info(f"Batch {batch_number} progress: {total_processed}/{len(batch)} "
+                           f"({success_rate:.1f}% success rate)")
             
             # Save state periodically
             if (successful + failed) % 5 == 0:

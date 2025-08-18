@@ -9,17 +9,17 @@ from pathlib import Path
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 
-# Read requirements
+# Read core requirements
 requirements = []
-with open("requirements.txt", "r") as f:
+with open("requirements-core.txt", "r") as f:
     for line in f:
         line = line.strip()
-        if line and not line.startswith("#"):
+        if line and not line.startswith("#") and not line.startswith("-r"):
             requirements.append(line)
 
 setup(
     name="pdf-knowledge-extractor",
-    version="0.1.0",
+    version="1.0.0",
     author="Your Name",
     author_email="your.email@example.com",
     description="A tool for extracting and analyzing knowledge from PDF documents",
@@ -45,6 +45,18 @@ setup(
     python_requires=">=3.8",
     install_requires=requirements,
     extras_require={
+        "nlp": [
+            "spacy>=3.4.0",
+            "scikit-learn>=1.1.0",
+        ],
+        "advanced": [
+            "spacy>=3.4.0",
+            "scikit-learn>=1.1.0",
+            "transformers>=4.20.0",
+            "torch>=1.12.0",
+            "matplotlib>=3.5.0",
+            "wordcloud>=1.9.0",
+        ],
         "dev": [
             "pytest>=7.0.0",
             "pytest-cov>=4.0.0",

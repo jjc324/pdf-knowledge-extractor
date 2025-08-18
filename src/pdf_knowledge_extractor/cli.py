@@ -35,8 +35,14 @@ Examples:
   # Custom limits for analysis
   pdf-extract /path/to/pdfs --mode analyze --max-size 25 --max-pages 200
   
+  # Test Claude CLI health
+  pdf-extract --test-claude
+  
   # Claude batch processing (after running analysis)
   pdf-extract /path/to/pdfs --mode claude-batch --output ./claude_results
+  
+  # Claude batch with reliability features
+  pdf-extract /path/to/pdfs --mode claude-batch --skip-failed --claude-timeout 180
   
   # Claude batch with custom settings
   pdf-extract /path/to/pdfs --mode claude-batch --batch-size 10 --max-retries 5
@@ -45,6 +51,7 @@ Examples:
     
     parser.add_argument(
         "path",
+        nargs="?",
         help="Path to PDF file or directory containing PDFs"
     )
     
@@ -135,6 +142,24 @@ Examples:
         help="Maximum retry attempts for failed documents"
     )
     
+    parser.add_argument(
+        "--test-claude",
+        action="store_true",
+        help="Test Claude CLI health before processing"
+    )
+    
+    parser.add_argument(
+        "--skip-failed",
+        action="store_true",
+        help="Skip documents that fail processing instead of retrying"
+    )
+    
+    parser.add_argument(
+        "--claude-timeout",
+        type=int,
+        help="Timeout in seconds for Claude CLI operations (default: 120)"
+    )
+    
     # Progress and logging
     parser.add_argument(
         "--no-progress",
@@ -154,6 +179,23 @@ Examples:
     )
     
     return parser
+
+
+def test_claude_cli(logger) -> int:
+    """Test Claude CLI health and return appropriate exit code."""
+    from .claude_integration import ClaudeIntegration
+    
+    claude_integration = ClaudeIntegration({})
+    is_healthy, message = claude_integration.test_claude_cli_health()
+    
+    if is_healthy:
+        logger.info(f"✅ Claude CLI is healthy: {message}")
+        return 0
+    else:
+        logger.error(f"❌ Claude CLI health check failed: {message}")
+        logger.error("Please ensure Claude CLI is properly installed and configured.")
+        logger.error("Installation: https://github.com/anthropics/claude-cli")
+        return 1
 
 
 def handle_claude_batch_processing(args, config: Dict, logger) -> int:
@@ -188,6 +230,16 @@ def handle_claude_batch_processing(args, config: Dict, logger) -> int:
         
         # Initialize Claude integration
         claude_integration = ClaudeIntegration(config)
+        
+        # Perform initial health check if enabled
+        if not args.skip_failed:  # Only do health check if we're not skipping failures
+            is_healthy, health_msg = claude_integration.test_claude_cli_health()
+            if not is_healthy:
+                logger.error(f"Claude CLI health check failed: {health_msg}")
+                logger.error("Consider using --skip-failed to continue processing despite failures")
+                return 1
+            else:
+                logger.info(f"Claude CLI health check passed: {health_msg}")
         
         # Run batch processing
         results = claude_integration.run_batch_processing(
@@ -249,10 +301,24 @@ def main() -> int:
             config.setdefault('claude', {})['batch_size'] = args.batch_size
         if args.max_retries is not None:
             config.setdefault('claude', {})['max_retries'] = args.max_retries
+        if args.claude_timeout is not None:
+            config.setdefault('claude', {})['timeout'] = args.claude_timeout
+        if args.skip_failed:
+            config.setdefault('claude', {})['skip_failed'] = args.skip_failed
         
         # Progress settings
         if args.no_progress:
             config.setdefault('progress', {})['enabled'] = False
+        
+        # Handle test-claude flag
+        if args.test_claude:
+            return test_claude_cli(logger)
+        
+        # Check if path is required and provided
+        if not args.path:
+            logger.error("Path argument is required for this operation")
+            logger.error("Use --help to see available options")
+            return 1
         
         # Handle Claude batch processing mode
         if args.mode == "claude-batch":
