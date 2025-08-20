@@ -77,17 +77,35 @@ class DocumentContext:
     related_documents: List[str] = None
     retry_delays: List[float] = None  # Track actual delays used
     content_filtered: bool = False  # Whether content was pre-filtered
+    quality_score: float = 0.0  # Overall quality score (0-1)
+    quality_metrics: Dict[str, float] = None  # Detailed quality metrics
+    document_type: str = "unknown"  # Detected document type
+    processing_difficulty: str = "normal"  # easy, normal, hard, very_hard
+    
+    # Smart retry and quarantine fields
+    quarantined: bool = False  # Whether document is quarantined
+    quarantine_reason: Optional[str] = None  # Reason for quarantine
+    quarantine_timestamp: Optional[str] = None  # When quarantined
+    consecutive_failures: int = 0  # Consecutive failures for this document
+    failure_pattern: List[str] = None  # Pattern of failure types
+    retry_strategy: str = "standard"  # standard, aggressive, conservative, skip
+    next_retry_time: Optional[str] = None  # When to retry next (for quarantined docs)
+    success_probability: float = 1.0  # Estimated success probability (0-1)
     
     def __post_init__(self):
         if self.related_documents is None:
             self.related_documents = []
         if self.retry_delays is None:
             self.retry_delays = []
+        if self.quality_metrics is None:
+            self.quality_metrics = {}
+        if self.failure_pattern is None:
+            self.failure_pattern = []
 
 
 @dataclass 
 class BatchProgress:
-    """Progress tracking for batch processing."""
+    """Enhanced progress tracking for batch processing with ETA and trends."""
     total_documents: int
     processed_documents: int
     failed_documents: int
@@ -100,6 +118,34 @@ class BatchProgress:
     claude_health_status: str = "unknown"  # healthy, degraded, unhealthy
     consecutive_failures: int = 0
     rate_limit_hits: int = 0
+    
+    # Enhanced tracking fields
+    processing_rate_history: List[float] = None  # docs/minute over time
+    success_rate_history: List[float] = None  # success rate over time  
+    batch_durations: List[float] = None  # time per batch in minutes
+    documents_per_minute: float = 0.0
+    tokens_per_minute: float = 0.0
+    average_doc_processing_time: float = 0.0  # seconds
+    time_per_token: float = 0.0  # seconds per token
+    
+    # Quality and type tracking
+    quality_distribution: Dict[str, int] = None  # quality ranges -> count
+    type_distribution: Dict[str, int] = None  # doc types -> count
+    difficulty_distribution: Dict[str, int] = None  # difficulty -> count
+    
+    def __post_init__(self):
+        if self.processing_rate_history is None:
+            self.processing_rate_history = []
+        if self.success_rate_history is None:
+            self.success_rate_history = []
+        if self.batch_durations is None:
+            self.batch_durations = []
+        if self.quality_distribution is None:
+            self.quality_distribution = {}
+        if self.type_distribution is None:
+            self.type_distribution = {}
+        if self.difficulty_distribution is None:
+            self.difficulty_distribution = {}
     
     @property
     def completion_percentage(self) -> float:
@@ -114,6 +160,78 @@ class BatchProgress:
         if total_attempted == 0:
             return 0.0
         return (self.processed_documents / total_attempted) * 100
+    
+    @property
+    def success_rate_trend(self) -> str:
+        """Calculate success rate trend over recent history."""
+        if len(self.success_rate_history) < 3:
+            return "stable"
+        
+        # Compare last 3 vs previous 3 rates
+        recent_rates = self.success_rate_history[-3:]
+        earlier_rates = self.success_rate_history[-6:-3] if len(self.success_rate_history) >= 6 else []
+        
+        if not earlier_rates:
+            return "stable"
+        
+        recent_avg = sum(recent_rates) / len(recent_rates)
+        earlier_avg = sum(earlier_rates) / len(earlier_rates)
+        
+        if recent_avg > earlier_avg + 5:
+            return "improving"
+        elif recent_avg < earlier_avg - 5:
+            return "declining"
+        else:
+            return "stable"
+    
+    @property
+    def processing_rate_trend(self) -> str:
+        """Calculate processing rate trend over recent history."""
+        if len(self.processing_rate_history) < 3:
+            return "stable"
+        
+        # Compare last 3 vs previous 3 rates
+        recent_rates = self.processing_rate_history[-3:]
+        earlier_rates = self.processing_rate_history[-6:-3] if len(self.processing_rate_history) >= 6 else []
+        
+        if not earlier_rates:
+            return "stable"
+        
+        recent_avg = sum(recent_rates) / len(recent_rates)
+        earlier_avg = sum(earlier_rates) / len(earlier_rates)
+        
+        if recent_avg > earlier_avg * 1.1:
+            return "accelerating"
+        elif recent_avg < earlier_avg * 0.9:
+            return "slowing"
+        else:
+            return "stable"
+    
+    def update_processing_metrics(self, elapsed_minutes: float, tokens_processed: int = 0):
+        """Update processing rate metrics.
+        
+        Args:
+            elapsed_minutes: Time elapsed since start
+            tokens_processed: Total tokens processed so far
+        """
+        if elapsed_minutes > 0:
+            self.documents_per_minute = self.processed_documents / elapsed_minutes
+            
+            if tokens_processed > 0:
+                self.tokens_per_minute = tokens_processed / elapsed_minutes
+                self.time_per_token = (elapsed_minutes * 60) / tokens_processed
+            
+            if self.processed_documents > 0:
+                self.average_doc_processing_time = (elapsed_minutes * 60) / self.processed_documents
+            
+            # Add to history (keep last 20 measurements)
+            self.processing_rate_history.append(self.documents_per_minute)
+            if len(self.processing_rate_history) > 20:
+                self.processing_rate_history.pop(0)
+            
+            self.success_rate_history.append(self.success_rate)
+            if len(self.success_rate_history) > 20:
+                self.success_rate_history.pop(0)
 
 
 class ClaudeIntegration:
@@ -376,6 +494,170 @@ class ClaudeIntegration:
         
         return delay + jitter
     
+    def calculate_success_probability(self, context: DocumentContext) -> float:
+        """Calculate estimated success probability for a document based on its history.
+        
+        Args:
+            context: Document context with retry history
+            
+        Returns:
+            Success probability (0.0 to 1.0)
+        """
+        base_probability = 0.8  # Base success rate
+        
+        # Adjust based on retry count
+        retry_penalty = min(context.retry_count * 0.15, 0.6)  # Max 60% penalty
+        probability = base_probability - retry_penalty
+        
+        # Adjust based on failure pattern
+        if context.failure_pattern:
+            # Count different error types
+            error_types = set(context.failure_pattern)
+            
+            # Multiple different error types indicate systemic issues
+            if len(error_types) > 2:
+                probability *= 0.7
+            
+            # Check for non-retryable errors
+            non_retryable_count = sum(
+                1 for error_type in context.failure_pattern
+                if error_type in ['CLI_NOT_FOUND', 'CLI_AUTH_ERROR', 'CONTENT_TOO_LARGE']
+            )
+            if non_retryable_count > 0:
+                probability *= 0.3
+        
+        # Adjust based on document quality
+        if hasattr(context, 'quality_score'):
+            quality_factor = max(context.quality_score, 0.2)  # Min factor of 0.2
+            probability *= quality_factor
+        
+        # Adjust based on document size/complexity
+        if context.estimated_tokens > 50000:  # Very large documents
+            probability *= 0.8
+        elif context.estimated_tokens > 20000:  # Large documents
+            probability *= 0.9
+        
+        return max(min(probability, 1.0), 0.0)  # Clamp to [0, 1]
+    
+    def determine_retry_strategy(self, context: DocumentContext) -> str:
+        """Determine the best retry strategy for a document.
+        
+        Args:
+            context: Document context
+            
+        Returns:
+            Retry strategy: 'aggressive', 'standard', 'conservative', 'skip'
+        """
+        success_prob = self.calculate_success_probability(context)
+        
+        # Skip strategy for very low probability
+        if success_prob < 0.2:
+            return "skip"
+        
+        # Conservative strategy for problematic documents
+        if (context.consecutive_failures >= 3 or 
+            success_prob < 0.4 or
+            context.retry_count >= self.max_retries - 1):
+            return "conservative"
+        
+        # Aggressive strategy for high-quality documents with temporary issues
+        if (success_prob > 0.7 and 
+            context.retry_count <= 1 and
+            hasattr(context, 'quality_score') and context.quality_score > 0.8):
+            return "aggressive"
+        
+        # Standard strategy for most cases
+        return "standard"
+    
+    def should_quarantine_document(self, context: DocumentContext, 
+                                 error_type: ClaudeErrorType) -> Tuple[bool, str]:
+        """Determine if a document should be quarantined.
+        
+        Args:
+            context: Document context
+            error_type: Latest error type
+            
+        Returns:
+            Tuple of (should_quarantine, reason)
+        """
+        # Already quarantined
+        if context.quarantined:
+            return False, "Already quarantined"
+        
+        # Immediate quarantine conditions
+        if error_type in [ClaudeErrorType.CLI_NOT_FOUND, ClaudeErrorType.CLI_AUTH_ERROR]:
+            return True, f"Critical system error: {error_type.value}"
+        
+        # Quarantine after multiple failures
+        if context.consecutive_failures >= 5:
+            return True, f"Too many consecutive failures ({context.consecutive_failures})"
+        
+        # Quarantine if same error type repeats multiple times
+        if context.failure_pattern:
+            last_error_count = sum(
+                1 for err in context.failure_pattern[-3:]  # Last 3 errors
+                if err == error_type.value
+            )
+            if last_error_count >= 3:
+                return True, f"Repeated {error_type.value} errors"
+        
+        # Quarantine very low success probability documents
+        success_prob = self.calculate_success_probability(context)
+        if success_prob < 0.1:
+            return True, f"Very low success probability ({success_prob:.2f})"
+        
+        return False, "No quarantine needed"
+    
+    def quarantine_document(self, context: DocumentContext, reason: str) -> None:
+        """Quarantine a problematic document.
+        
+        Args:
+            context: Document context
+            reason: Reason for quarantine
+        """
+        context.quarantined = True
+        context.quarantine_reason = reason
+        context.quarantine_timestamp = datetime.now().isoformat()
+        context.processing_status = ProcessingStatus.SKIPPED
+        
+        # Calculate next retry time (exponential backoff from quarantine)
+        quarantine_delay_hours = min(2 ** context.consecutive_failures, 24)  # Max 24 hours
+        next_retry = datetime.now() + timedelta(hours=quarantine_delay_hours)
+        context.next_retry_time = next_retry.isoformat()
+        
+        logger.warning(f"Quarantined document {context.filename}: {reason}")
+        logger.info(f"Next retry scheduled for: {next_retry.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    def check_quarantine_release(self, context: DocumentContext) -> bool:
+        """Check if a quarantined document can be released for retry.
+        
+        Args:
+            context: Quarantined document context
+            
+        Returns:
+            True if document can be released from quarantine
+        """
+        if not context.quarantined or not context.next_retry_time:
+            return False
+        
+        next_retry = datetime.fromisoformat(context.next_retry_time)
+        return datetime.now() >= next_retry
+    
+    def release_from_quarantine(self, context: DocumentContext) -> None:
+        """Release a document from quarantine.
+        
+        Args:
+            context: Document context to release
+        """
+        context.quarantined = False
+        context.processing_status = ProcessingStatus.PENDING
+        context.next_retry_time = None
+        
+        # Reset some counters for fresh start
+        context.consecutive_failures = max(0, context.consecutive_failures - 1)
+        
+        logger.info(f"Released {context.filename} from quarantine")
+    
     def test_claude_cli_health(self) -> Tuple[bool, str]:
         """Test Claude CLI availability and basic functionality.
         
@@ -438,6 +720,128 @@ class ClaudeIntegration:
         
         return text.strip()
     
+    def calculate_document_quality_score(self, text: str, context: DocumentContext) -> Dict[str, float]:
+        """Calculate comprehensive document quality score with detailed metrics.
+        
+        Args:
+            text: Document text content
+            context: Document context with metadata
+            
+        Returns:
+            Dictionary with quality metrics and overall score
+        """
+        metrics = {
+            'text_quality': 0.0,
+            'extraction_ratio': 0.0,
+            'content_density': 0.0,
+            'language_quality': 0.0,
+            'structure_quality': 0.0,
+            'overall_score': 0.0
+        }
+        
+        if not text or not text.strip():
+            return metrics
+        
+        # 1. Text Quality (40% weight)
+        alphanumeric_chars = sum(1 for c in text if c.isalnum())
+        total_chars = len(text)
+        
+        if total_chars > 0:
+            # Basic alphanumeric ratio
+            alphanumeric_ratio = alphanumeric_chars / total_chars
+            
+            # Adjust for reasonable punctuation and whitespace
+            if 0.6 <= alphanumeric_ratio <= 0.9:
+                metrics['text_quality'] = 1.0
+            elif 0.4 <= alphanumeric_ratio < 0.6:
+                metrics['text_quality'] = 0.7
+            elif 0.2 <= alphanumeric_ratio < 0.4:
+                metrics['text_quality'] = 0.4
+            else:
+                metrics['text_quality'] = 0.1
+        
+        # 2. Text Extraction Ratio (25% weight)
+        # Compare actual text length to expected based on pages
+        expected_chars_per_page = 2500  # Reasonable estimate for text-heavy documents
+        expected_total = context.page_count * expected_chars_per_page
+        
+        if expected_total > 0:
+            extraction_ratio = min(len(text) / expected_total, 2.0)  # Cap at 2.0 for dense documents
+            
+            if extraction_ratio >= 0.8:
+                metrics['extraction_ratio'] = 1.0
+            elif extraction_ratio >= 0.5:
+                metrics['extraction_ratio'] = 0.8
+            elif extraction_ratio >= 0.2:
+                metrics['extraction_ratio'] = 0.5
+            else:
+                metrics['extraction_ratio'] = 0.2
+        
+        # 3. Content Density (15% weight)
+        # Check for reasonable word-to-character ratio
+        words = text.split()
+        if words:
+            avg_word_length = len(''.join(words)) / len(words)
+            
+            # Reasonable average word length is 4-8 characters
+            if 4 <= avg_word_length <= 8:
+                metrics['content_density'] = 1.0
+            elif 3 <= avg_word_length < 4 or 8 < avg_word_length <= 12:
+                metrics['content_density'] = 0.7
+            else:
+                metrics['content_density'] = 0.3
+        
+        # 4. Language Quality (10% weight)
+        # Check for excessive repetition and gibberish
+        if len(words) > 50:
+            unique_words = len(set(word.lower() for word in words))
+            unique_ratio = unique_words / len(words)
+            
+            if unique_ratio >= 0.4:
+                metrics['language_quality'] = 1.0
+            elif unique_ratio >= 0.2:
+                metrics['language_quality'] = 0.6
+            elif unique_ratio >= 0.1:
+                metrics['language_quality'] = 0.3
+            else:
+                metrics['language_quality'] = 0.1
+        else:
+            metrics['language_quality'] = 0.8  # Give benefit of doubt for short texts
+        
+        # 5. Structure Quality (10% weight)
+        # Look for structural elements that indicate proper text extraction
+        structure_indicators = [
+            r'\n\n',  # Paragraph breaks
+            r'[.!?]\s+[A-Z]',  # Sentence boundaries
+            r':\s*\n',  # Lists or definitions
+            r'^\s*\d+\.',  # Numbered lists
+            r'^\s*[•\-\*]',  # Bullet points
+        ]
+        
+        structure_score = 0
+        for pattern in structure_indicators:
+            import re
+            if re.search(pattern, text):
+                structure_score += 0.2
+        
+        metrics['structure_quality'] = min(structure_score, 1.0)
+        
+        # Calculate overall weighted score
+        weights = {
+            'text_quality': 0.40,
+            'extraction_ratio': 0.25,
+            'content_density': 0.15,
+            'language_quality': 0.10,
+            'structure_quality': 0.10
+        }
+        
+        metrics['overall_score'] = sum(
+            metrics[metric] * weight 
+            for metric, weight in weights.items()
+        )
+        
+        return metrics
+
     def validate_text_quality(self, text: str) -> Tuple[bool, str]:
         """Validate text quality for Claude processing.
         
@@ -472,8 +876,77 @@ class ClaudeIntegration:
         
         return True, "Text quality acceptable"
     
+    def detect_document_type(self, text: str, context: DocumentContext) -> str:
+        """Detect document type based on content analysis.
+        
+        Args:
+            text: Document text content
+            context: Document context with metadata
+            
+        Returns:
+            Detected document type (academic, business, technical, creative, legal, etc.)
+        """
+        if not text:
+            return "unknown"
+        
+        text_lower = text.lower()
+        
+        # Academic indicators
+        academic_keywords = [
+            'abstract', 'methodology', 'literature review', 'hypothesis', 'research',
+            'citation', 'bibliography', 'peer review', 'journal', 'publication',
+            'experiment', 'data analysis', 'statistical', 'study', 'findings',
+            'conclusion', 'university', 'professor', 'phd', 'doctoral'
+        ]
+        
+        # Business indicators  
+        business_keywords = [
+            'revenue', 'profit', 'market', 'business plan', 'strategy', 'roi',
+            'investment', 'financial', 'quarterly', 'annual report', 'stakeholder',
+            'executive summary', 'kpi', 'metrics', 'corporate', 'company',
+            'organization', 'management', 'board of directors', 'shareholder'
+        ]
+        
+        # Technical indicators
+        technical_keywords = [
+            'algorithm', 'implementation', 'system', 'architecture', 'framework',
+            'api', 'database', 'server', 'client', 'protocol', 'specification',
+            'technical', 'engineering', 'software', 'hardware', 'documentation',
+            'manual', 'guide', 'tutorial', 'installation', 'configuration'
+        ]
+        
+        # Legal indicators
+        legal_keywords = [
+            'contract', 'agreement', 'clause', 'provision', 'legal', 'law',
+            'regulation', 'compliance', 'terms', 'conditions', 'liability',
+            'warranty', 'intellectual property', 'copyright', 'patent',
+            'litigation', 'court', 'judge', 'jury', 'counsel'
+        ]
+        
+        # Creative indicators
+        creative_keywords = [
+            'story', 'narrative', 'character', 'plot', 'theme', 'creative',
+            'artistic', 'design', 'aesthetic', 'poetry', 'novel', 'fiction',
+            'non-fiction', 'memoir', 'autobiography', 'biography', 'essay'
+        ]
+        
+        # Count keyword matches
+        keyword_counts = {
+            'academic': sum(1 for kw in academic_keywords if kw in text_lower),
+            'business': sum(1 for kw in business_keywords if kw in text_lower),
+            'technical': sum(1 for kw in technical_keywords if kw in text_lower),
+            'legal': sum(1 for kw in legal_keywords if kw in text_lower),
+            'creative': sum(1 for kw in creative_keywords if kw in text_lower)
+        }
+        
+        # Determine document type based on highest keyword count
+        if max(keyword_counts.values()) == 0:
+            return "general"
+        
+        return max(keyword_counts.items(), key=lambda x: x[1])[0]
+    
     def should_filter_document(self, context: DocumentContext, text: str) -> Tuple[bool, str]:
-        """Determine if document should be filtered before Claude processing.
+        """Determine if document should be filtered before Claude processing using advanced quality scoring.
         
         Args:
             context: Document context
@@ -486,26 +959,55 @@ class ClaudeIntegration:
         if context.content_filtered:
             return False, "Already filtered"
         
-        # Very large documents
+        # Get quality threshold from config
+        quality_threshold = self.config.get('claude', {}).get('quality_threshold', 0.5)
+        
+        # Calculate comprehensive quality score
+        quality_metrics = self.calculate_document_quality_score(text, context)
+        overall_score = quality_metrics['overall_score']
+        
+        # Store quality metrics in context for later reference
+        context.quality_score = overall_score
+        context.quality_metrics = quality_metrics
+        
+        # Very large documents - size-based filtering
         if context.size_mb > 50:  # 50MB+ files
-            return True, "File too large (>50MB)"
+            return True, f"File too large (>50MB) - Quality: {overall_score:.2f}"
         
-        # Too many pages (likely scanned documents with poor text extraction)
+        # Too many pages (likely scanned documents with poor text extraction)  
         if context.page_count > 500:
-            return True, "Too many pages (>500)"
+            return True, f"Too many pages (>500) - Quality: {overall_score:.2f}"
         
-        # Poor text extraction ratio
-        expected_chars_per_page = 2000  # Rough estimate
-        expected_total = context.page_count * expected_chars_per_page
-        if expected_total > 0 and len(text) < (expected_total * 0.1):
-            return True, "Poor text extraction ratio"
+        # Quality-based filtering
+        if overall_score < quality_threshold:
+            # Provide detailed reason based on weakest metric
+            weak_metrics = [
+                (metric, score) for metric, score in quality_metrics.items()
+                if metric != 'overall_score' and score < 0.3
+            ]
+            
+            if weak_metrics:
+                weakest_metric, weakest_score = min(weak_metrics, key=lambda x: x[1])
+                reason = f"Low quality score ({overall_score:.2f} < {quality_threshold}) - Weak {weakest_metric}: {weakest_score:.2f}"
+            else:
+                reason = f"Low quality score ({overall_score:.2f} < {quality_threshold})"
+            
+            return True, reason
         
-        # Text quality issues
+        # Detect document type for processing optimization
+        doc_type = self.detect_document_type(text, context)
+        context.document_type = doc_type
+        
+        # Special handling for certain document types
+        if doc_type == "unknown" and overall_score < 0.7:
+            return True, f"Unknown document type with moderate quality ({overall_score:.2f})"
+        
+        # Text quality issues (fallback)
         is_valid, reason = self.validate_text_quality(text)
         if not is_valid:
-            return True, f"Text quality issue: {reason}"
+            return True, f"Text validation failed: {reason} - Quality: {overall_score:.2f}"
         
-        return False, "Document passes filtering"
+        return False, f"Document passes filtering - Quality: {overall_score:.2f}, Type: {doc_type}"
     
     def should_chunk_document(self, context: DocumentContext) -> bool:
         """Determine if document should be chunked based on size.
@@ -588,11 +1090,132 @@ class ClaudeIntegration:
                     last_error=str(e)
                 )
     
+    def calculate_adaptive_batch_size(self, context: DocumentContext) -> int:
+        """Calculate adaptive batch size based on document complexity.
+        
+        Args:
+            context: Document context with complexity metrics
+            
+        Returns:
+            Recommended batch size for this document type
+        """
+        # Base batch size from configuration
+        base_batch_size = self.batch_size
+        
+        # Small documents (< 5k tokens): batches of 8-10
+        if context.estimated_tokens < 5000:
+            return min(base_batch_size * 2, 10)
+        
+        # Medium documents (5k-20k tokens): batches of 3-5
+        elif context.estimated_tokens < 20000:
+            return min(base_batch_size, 5)
+        
+        # Large documents (20k+ tokens): batches of 1-2
+        else:
+            return min(base_batch_size // 2, 2)
+    
+    def group_documents_by_complexity(self) -> Dict[str, List[Tuple[str, DocumentContext]]]:
+        """Group documents by complexity for intelligent batching.
+        
+        Returns:
+            Dictionary mapping complexity level to list of (path, context) tuples
+        """
+        complexity_groups = {
+            'small': [],    # < 5k tokens
+            'medium': [],   # 5k-20k tokens  
+            'large': [],    # 20k+ tokens
+            'failed': []    # Previously failed documents
+        }
+        
+        for path, context in self.document_contexts.items():
+            if context.processing_status != ProcessingStatus.PENDING:
+                continue
+                
+            # Group failed documents separately for special handling
+            if context.retry_count > 0:
+                complexity_groups['failed'].append((path, context))
+            elif context.estimated_tokens < 5000:
+                complexity_groups['small'].append((path, context))
+            elif context.estimated_tokens < 20000:
+                complexity_groups['medium'].append((path, context))
+            else:
+                complexity_groups['large'].append((path, context))
+        
+        return complexity_groups
+
     def create_batches(self) -> List[List[str]]:
-        """Create processing batches based on token limits and configuration.
+        """Create processing batches with intelligent sizing based on document complexity.
         
         Returns:
             List of batches, each batch is a list of document paths
+        """
+        batches = []
+        
+        # Check if adaptive batching is enabled
+        adaptive_batching = self.config.get('claude', {}).get('adaptive_batching', True)
+        
+        if not adaptive_batching:
+            # Fall back to original batching logic
+            return self._create_simple_batches()
+        
+        # Group documents by complexity
+        complexity_groups = self.group_documents_by_complexity()
+        
+        # Process each complexity group with appropriate batch sizes
+        for complexity_level, docs in complexity_groups.items():
+            if not docs:
+                continue
+                
+            logger.info(f"Creating batches for {len(docs)} {complexity_level} documents")
+            
+            # Sort documents within group (smaller first for better progress tracking)
+            docs.sort(key=lambda x: x[1].estimated_tokens)
+            
+            current_batch = []
+            current_batch_tokens = 0
+            
+            for file_path, context in docs:
+                # Calculate adaptive batch size for this document type
+                adaptive_size = self.calculate_adaptive_batch_size(context)
+                
+                # Calculate token limit based on document complexity
+                if complexity_level == 'large':
+                    # Large documents: be more conservative with token limits
+                    token_limit = self.max_tokens_per_request // 2
+                elif complexity_level == 'failed':
+                    # Failed documents: process individually for easier debugging
+                    token_limit = context.estimated_tokens + 1000  # Small buffer
+                    adaptive_size = 1
+                else:
+                    # Small/medium documents: use normal token limits
+                    token_limit = self.max_tokens_per_request
+                
+                # Check if adding this document would exceed limits
+                would_exceed_count = len(current_batch) >= adaptive_size
+                would_exceed_tokens = current_batch_tokens + context.estimated_tokens > token_limit
+                
+                if (would_exceed_count or would_exceed_tokens) and current_batch:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_batch_tokens = 0
+                
+                current_batch.append(file_path)
+                current_batch_tokens += context.estimated_tokens
+            
+            # Add final batch for this complexity group
+            if current_batch:
+                batches.append(current_batch)
+        
+        # Log batch statistics
+        self._log_batch_statistics(batches, complexity_groups)
+        
+        return batches
+    
+    def _create_simple_batches(self) -> List[List[str]]:
+        """Create simple batches using original logic (fallback).
+        
+        Returns:
+            List of batches using original batching algorithm
         """
         batches = []
         current_batch = []
@@ -622,8 +1245,48 @@ class ClaudeIntegration:
         if current_batch:
             batches.append(current_batch)
         
-        logger.info(f"Created {len(batches)} processing batches")
+        logger.info(f"Created {len(batches)} simple processing batches")
         return batches
+    
+    def _log_batch_statistics(self, batches: List[List[str]], 
+                            complexity_groups: Dict[str, List[Tuple[str, DocumentContext]]]) -> None:
+        """Log detailed statistics about created batches.
+        
+        Args:
+            batches: Created batches
+            complexity_groups: Document groups by complexity
+        """
+        total_docs = sum(len(group) for group in complexity_groups.values())
+        
+        # Calculate batch size statistics
+        batch_sizes = [len(batch) for batch in batches]
+        avg_batch_size = sum(batch_sizes) / len(batch_sizes) if batch_sizes else 0
+        
+        # Calculate token statistics
+        batch_tokens = []
+        for batch in batches:
+            batch_token_count = sum(
+                self.document_contexts[path].estimated_tokens 
+                for path in batch
+            )
+            batch_tokens.append(batch_token_count)
+        
+        avg_batch_tokens = sum(batch_tokens) / len(batch_tokens) if batch_tokens else 0
+        
+        logger.info(f"Adaptive batch creation summary:")
+        logger.info(f"  Total documents: {total_docs}")
+        logger.info(f"  Small docs (<5k tokens): {len(complexity_groups['small'])}")
+        logger.info(f"  Medium docs (5k-20k tokens): {len(complexity_groups['medium'])}")
+        logger.info(f"  Large docs (20k+ tokens): {len(complexity_groups['large'])}")
+        logger.info(f"  Previously failed docs: {len(complexity_groups['failed'])}")
+        logger.info(f"  Total batches created: {len(batches)}")
+        logger.info(f"  Average batch size: {avg_batch_size:.1f} documents")
+        logger.info(f"  Average tokens per batch: {avg_batch_tokens:,.0f}")
+        
+        if batch_sizes:
+            logger.info(f"  Batch size range: {min(batch_sizes)}-{max(batch_sizes)} documents")
+        if batch_tokens:
+            logger.info(f"  Token range per batch: {min(batch_tokens):,}-{max(batch_tokens):,}")
     
     def extract_keywords(self, text: str, max_keywords: int = 20) -> List[str]:
         """Extract keywords from text for cross-referencing.
@@ -1009,12 +1672,42 @@ Please format your response in clear markdown with appropriate headers. Focus on
                     
                     context.last_error_type = claude_error.error_type
                     
+                    # Update failure tracking
+                    context.consecutive_failures += 1
+                    context.failure_pattern.append(claude_error.error_type.value)
+                    
+                    # Keep only last 10 failure patterns to avoid memory bloat
+                    if len(context.failure_pattern) > 10:
+                        context.failure_pattern.pop(0)
+                    
+                    # Update success probability
+                    context.success_probability = self.calculate_success_probability(context)
+                    
+                    # Determine retry strategy
+                    context.retry_strategy = self.determine_retry_strategy(context)
+                    
+                    # Check for quarantine
+                    should_quarantine, quarantine_reason = self.should_quarantine_document(
+                        context, claude_error.error_type
+                    )
+                    
+                    if should_quarantine:
+                        self.quarantine_document(context, quarantine_reason)
+                        return False, f"Document quarantined: {quarantine_reason}"
+                    
                     # Check if error is retryable
                     if not claude_error.is_retryable:
                         logger.error(f"Non-retryable error for {context.filename}: {claude_error.error_type.value} - {e}")
                         context.processing_status = ProcessingStatus.FAILED
                         context.processing_end = datetime.now().isoformat()
                         return False, f"Non-retryable error: {str(e)}"
+                    
+                    # Check retry strategy
+                    if context.retry_strategy == "skip":
+                        logger.warning(f"Skipping {context.filename} due to low success probability ({context.success_probability:.2f})")
+                        context.processing_status = ProcessingStatus.SKIPPED
+                        context.processing_end = datetime.now().isoformat()
+                        return False, f"Skipped due to low success probability: {str(e)}"
                     
                 except Exception:
                     # Fallback error categorization
@@ -1024,6 +1717,7 @@ Please format your response in clear markdown with appropriate headers. Focus on
                         is_retryable=True
                     )
                     context.last_error_type = claude_error.error_type
+                    context.consecutive_failures += 1
                 
                 # Skip failed documents if configured
                 if self.skip_failed and claude_error.error_type in [
@@ -1037,17 +1731,34 @@ Please format your response in clear markdown with appropriate headers. Focus on
                     return False, f"Document skipped: {str(e)}"
                 
                 if attempt < self.max_retries:
-                    # Calculate intelligent backoff delay
-                    delay = self.calculate_exponential_backoff(attempt, claude_error.error_type)
+                    # Calculate intelligent backoff delay based on retry strategy
+                    base_delay = self.calculate_exponential_backoff(attempt, claude_error.error_type)
+                    
+                    # Adjust delay based on retry strategy
+                    strategy_multipliers = {
+                        "aggressive": 0.5,    # Retry faster
+                        "standard": 1.0,      # Normal delay
+                        "conservative": 2.0,  # Wait longer
+                    }
+                    
+                    strategy_multiplier = strategy_multipliers.get(context.retry_strategy, 1.0)
+                    delay = base_delay * strategy_multiplier
                     
                     # Use specific retry delay for certain errors
                     if claude_error.retry_after:
                         delay = max(delay, claude_error.retry_after)
                     
+                    # Additional delay for consecutive failures
+                    if context.consecutive_failures > 2:
+                        failure_multiplier = 1.0 + (context.consecutive_failures - 2) * 0.3
+                        delay *= failure_multiplier
+                    
                     context.retry_delays.append(delay)
                     
                     logger.warning(f"Attempt {attempt + 1} failed for {context.filename} "
-                                 f"({claude_error.error_type.value}), retrying in {delay:.1f}s: {e}")
+                                 f"({claude_error.error_type.value}), strategy: {context.retry_strategy}, "
+                                 f"probability: {context.success_probability:.2f}, "
+                                 f"retrying in {delay:.1f}s: {e}")
                     
                     # Update batch progress for rate limit tracking
                     if self.batch_progress and claude_error.error_type == ClaudeErrorType.RATE_LIMIT:
@@ -1268,7 +1979,7 @@ Please format your response in clear markdown with appropriate headers. Focus on
         return str(summary_path)
     
     def update_progress(self, batch_number: int, total_batches: int) -> None:
-        """Update batch progress tracking.
+        """Update enhanced batch progress tracking with detailed metrics.
         
         Args:
             batch_number: Current batch number
@@ -1277,25 +1988,122 @@ Please format your response in clear markdown with appropriate headers. Focus on
         if not self.batch_progress:
             return
         
+        # Count documents by status
         processed = sum(1 for ctx in self.document_contexts.values() 
                        if ctx.processing_status == ProcessingStatus.COMPLETED)
         failed = sum(1 for ctx in self.document_contexts.values() 
                     if ctx.processing_status == ProcessingStatus.FAILED)
+        skipped = sum(1 for ctx in self.document_contexts.values() 
+                     if ctx.processing_status == ProcessingStatus.SKIPPED)
         
         self.batch_progress.processed_documents = processed
         self.batch_progress.failed_documents = failed
+        self.batch_progress.skipped_documents = skipped
         self.batch_progress.current_batch = batch_number
         self.batch_progress.total_batches = total_batches
         self.batch_progress.last_update = datetime.now().isoformat()
         
-        # Estimate completion time
+        # Calculate elapsed time
+        start_time = datetime.fromisoformat(self.batch_progress.start_time)
+        elapsed = datetime.now() - start_time
+        elapsed_minutes = elapsed.total_seconds() / 60
+        
+        # Calculate total tokens processed
+        total_tokens = sum(
+            ctx.estimated_tokens for ctx in self.document_contexts.values()
+            if ctx.processing_status == ProcessingStatus.COMPLETED
+        )
+        
+        # Update processing metrics
+        self.batch_progress.update_processing_metrics(elapsed_minutes, total_tokens)
+        
+        # Update quality and type distributions
+        self._update_distribution_metrics()
+        
+        # Enhanced ETA calculation with trend consideration
         if processed > 0:
-            elapsed = datetime.now() - datetime.fromisoformat(self.batch_progress.start_time)
+            # Base ETA calculation
             avg_time_per_doc = elapsed.total_seconds() / processed
-            remaining_docs = self.batch_progress.total_documents - processed - failed
-            estimated_seconds = remaining_docs * avg_time_per_doc
+            remaining_docs = self.batch_progress.total_documents - processed - failed - skipped
+            
+            # Adjust for processing rate trend
+            rate_trend = self.batch_progress.processing_rate_trend
+            rate_multiplier = 1.0
+            
+            if rate_trend == "accelerating":
+                rate_multiplier = 0.9  # 10% faster
+            elif rate_trend == "slowing":
+                rate_multiplier = 1.1  # 10% slower
+            
+            # Consider success rate trend for retry overhead
+            success_trend = self.batch_progress.success_rate_trend
+            if success_trend == "declining":
+                rate_multiplier *= 1.2  # 20% more time for retries
+            
+            adjusted_time_per_doc = avg_time_per_doc * rate_multiplier
+            estimated_seconds = remaining_docs * adjusted_time_per_doc
+            
+            # Add buffer based on Claude health status
+            health_buffer = {
+                "healthy": 1.0,
+                "degraded": 1.2,
+                "unhealthy": 1.5
+            }.get(self.batch_progress.claude_health_status, 1.1)
+            
+            estimated_seconds *= health_buffer
+            
             estimated_completion = datetime.now() + timedelta(seconds=estimated_seconds)
             self.batch_progress.estimated_completion = estimated_completion.isoformat()
+    
+    def _update_distribution_metrics(self) -> None:
+        """Update quality, type, and difficulty distribution metrics."""
+        if not self.batch_progress:
+            return
+        
+        # Reset distributions
+        self.batch_progress.quality_distribution = {
+            "high (0.8-1.0)": 0,
+            "good (0.6-0.8)": 0,
+            "fair (0.4-0.6)": 0,
+            "poor (0.2-0.4)": 0,
+            "very_poor (0.0-0.2)": 0
+        }
+        
+        self.batch_progress.type_distribution = {}
+        self.batch_progress.difficulty_distribution = {
+            "easy": 0,
+            "normal": 0, 
+            "hard": 0,
+            "very_hard": 0
+        }
+        
+        # Count distributions from all document contexts
+        for context in self.document_contexts.values():
+            # Quality distribution
+            if hasattr(context, 'quality_score'):
+                score = context.quality_score
+                if score >= 0.8:
+                    self.batch_progress.quality_distribution["high (0.8-1.0)"] += 1
+                elif score >= 0.6:
+                    self.batch_progress.quality_distribution["good (0.6-0.8)"] += 1
+                elif score >= 0.4:
+                    self.batch_progress.quality_distribution["fair (0.4-0.6)"] += 1
+                elif score >= 0.2:
+                    self.batch_progress.quality_distribution["poor (0.2-0.4)"] += 1
+                else:
+                    self.batch_progress.quality_distribution["very_poor (0.0-0.2)"] += 1
+            
+            # Document type distribution
+            if hasattr(context, 'document_type'):
+                doc_type = context.document_type
+                self.batch_progress.type_distribution[doc_type] = \
+                    self.batch_progress.type_distribution.get(doc_type, 0) + 1
+            
+            # Processing difficulty distribution
+            if hasattr(context, 'processing_difficulty'):
+                difficulty = context.processing_difficulty
+                if difficulty in self.batch_progress.difficulty_distribution:
+                    self.batch_progress.difficulty_distribution[difficulty] += 1
     
     def run_batch_processing(self, processable_pdfs_file: Union[str, Path], 
                            output_dir: Union[str, Path], resume: bool = True) -> Dict[str, Any]:
@@ -1361,8 +2169,9 @@ Please format your response in clear markdown with appropriate headers. Focus on
             # Save state after each batch
             self.save_state()
         
-        # Generate final summary
+        # Generate final summary and performance report
         self.generate_final_summary(total_successful, total_failed)
+        self.generate_performance_report()
         
         # Final state save
         self.save_state()
@@ -1459,3 +2268,279 @@ Please format your response in clear markdown with appropriate headers. Focus on
         
         logger.info(f"Generated final summary: processing_summary.md")
         return str(summary_path)
+    
+    def generate_performance_report(self) -> str:
+        """Generate detailed performance report with metrics and insights.
+        
+        Returns:
+            Path to generated performance report
+        """
+        if not self.output_directory:
+            return ""
+        
+        report_path = self.output_directory / "performance_report.md"
+        
+        # Calculate comprehensive metrics
+        start_time = datetime.fromisoformat(self.batch_progress.start_time)
+        end_time = datetime.now()
+        total_duration = end_time - start_time
+        
+        # Document statistics
+        total_docs = len(self.document_contexts)
+        completed_docs = len([ctx for ctx in self.document_contexts.values() 
+                            if ctx.processing_status == ProcessingStatus.COMPLETED])
+        failed_docs = len([ctx for ctx in self.document_contexts.values() 
+                         if ctx.processing_status == ProcessingStatus.FAILED])
+        skipped_docs = len([ctx for ctx in self.document_contexts.values() 
+                          if ctx.processing_status == ProcessingStatus.SKIPPED])
+        quarantined_docs = len([ctx for ctx in self.document_contexts.values() 
+                              if ctx.quarantined])
+        
+        # Quality and type analysis
+        quality_metrics = self._analyze_quality_performance()
+        type_performance = self._analyze_type_performance()
+        retry_analysis = self._analyze_retry_patterns()
+        
+        # Performance metrics
+        total_tokens = sum(ctx.estimated_tokens for ctx in self.document_contexts.values() 
+                          if ctx.processing_status == ProcessingStatus.COMPLETED)
+        
+        avg_processing_time = (total_duration.total_seconds() / completed_docs) if completed_docs > 0 else 0
+        tokens_per_second = total_tokens / total_duration.total_seconds() if total_duration.total_seconds() > 0 else 0
+        
+        report_lines = []
+        report_lines.append("# PDF Knowledge Extractor - Performance Report")
+        report_lines.append("")
+        report_lines.append(f"**Generated**: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        report_lines.append(f"**Processing Duration**: {str(total_duration).split('.')[0]}")
+        report_lines.append("")
+        
+        # Executive Summary
+        report_lines.append("## Executive Summary")
+        report_lines.append("")
+        success_rate = (completed_docs / total_docs * 100) if total_docs > 0 else 0
+        report_lines.append(f"- **Overall Success Rate**: {success_rate:.1f}% ({completed_docs}/{total_docs} documents)")
+        report_lines.append(f"- **Processing Speed**: {self.batch_progress.documents_per_minute:.1f} docs/min, {tokens_per_second:.0f} tokens/sec")
+        report_lines.append(f"- **Average Processing Time**: {avg_processing_time:.1f} seconds per document")
+        report_lines.append(f"- **Total Tokens Processed**: {total_tokens:,}")
+        report_lines.append(f"- **Failed Documents**: {failed_docs} ({failed_docs/total_docs*100:.1f}%)")
+        report_lines.append(f"- **Quarantined Documents**: {quarantined_docs}")
+        report_lines.append("")
+        
+        # Processing Trends
+        if len(self.batch_progress.success_rate_history) > 1:
+            report_lines.append("## Processing Trends")
+            report_lines.append("")
+            report_lines.append(f"- **Success Rate Trend**: {self.batch_progress.success_rate_trend}")
+            report_lines.append(f"- **Processing Rate Trend**: {self.batch_progress.processing_rate_trend}")
+            
+            if self.batch_progress.rate_limit_hits > 0:
+                report_lines.append(f"- **Rate Limit Hits**: {self.batch_progress.rate_limit_hits}")
+            
+            if self.batch_progress.consecutive_failures > 0:
+                report_lines.append(f"- **Peak Consecutive Failures**: {self.batch_progress.consecutive_failures}")
+            
+            report_lines.append("")
+        
+        # Quality Performance Analysis
+        report_lines.extend(quality_metrics)
+        
+        # Document Type Performance
+        report_lines.extend(type_performance)
+        
+        # Retry and Error Analysis
+        report_lines.extend(retry_analysis)
+        
+        # Batch Performance
+        if self.batch_progress.batch_durations:
+            report_lines.append("## Batch Performance")
+            report_lines.append("")
+            avg_batch_time = sum(self.batch_progress.batch_durations) / len(self.batch_progress.batch_durations)
+            min_batch_time = min(self.batch_progress.batch_durations)
+            max_batch_time = max(self.batch_progress.batch_durations)
+            
+            report_lines.append(f"- **Total Batches**: {len(self.batch_progress.batch_durations)}")
+            report_lines.append(f"- **Average Batch Time**: {avg_batch_time:.1f} minutes")
+            report_lines.append(f"- **Fastest Batch**: {min_batch_time:.1f} minutes")
+            report_lines.append(f"- **Slowest Batch**: {max_batch_time:.1f} minutes")
+            report_lines.append("")
+        
+        # Recommendations
+        report_lines.append("## Performance Recommendations")
+        report_lines.append("")
+        
+        recommendations = self._generate_performance_recommendations(
+            success_rate, total_docs, failed_docs, quarantined_docs, 
+            quality_metrics, type_performance
+        )
+        
+        for rec in recommendations:
+            report_lines.append(f"- {rec}")
+        
+        report_lines.append("")
+        report_lines.append("---")
+        report_lines.append("*Generated by PDF Knowledge Extractor Performance Monitor*")
+        
+        # Save report
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(report_lines))
+        
+        logger.info(f"Generated performance report: performance_report.md")
+        return str(report_path)
+    
+    def _analyze_quality_performance(self) -> List[str]:
+        """Analyze performance by document quality."""
+        lines = []
+        lines.append("## Quality Performance Analysis")
+        lines.append("")
+        
+        quality_performance = {
+            "high": {"total": 0, "completed": 0, "failed": 0},
+            "medium": {"total": 0, "completed": 0, "failed": 0},
+            "low": {"total": 0, "completed": 0, "failed": 0}
+        }
+        
+        for ctx in self.document_contexts.values():
+            if hasattr(ctx, 'quality_score'):
+                if ctx.quality_score >= 0.7:
+                    quality_level = "high"
+                elif ctx.quality_score >= 0.4:
+                    quality_level = "medium"
+                else:
+                    quality_level = "low"
+                
+                quality_performance[quality_level]["total"] += 1
+                if ctx.processing_status == ProcessingStatus.COMPLETED:
+                    quality_performance[quality_level]["completed"] += 1
+                elif ctx.processing_status == ProcessingStatus.FAILED:
+                    quality_performance[quality_level]["failed"] += 1
+        
+        for quality_level, stats in quality_performance.items():
+            if stats["total"] > 0:
+                success_rate = (stats["completed"] / stats["total"]) * 100
+                lines.append(f"**{quality_level.title()} Quality Documents**:")
+                lines.append(f"- Total: {stats['total']}")
+                lines.append(f"- Success Rate: {success_rate:.1f}%")
+                lines.append(f"- Completed: {stats['completed']}, Failed: {stats['failed']}")
+                lines.append("")
+        
+        return lines
+    
+    def _analyze_type_performance(self) -> List[str]:
+        """Analyze performance by document type."""
+        lines = []
+        lines.append("## Document Type Performance")
+        lines.append("")
+        
+        type_performance = {}
+        
+        for ctx in self.document_contexts.values():
+            if hasattr(ctx, 'document_type'):
+                doc_type = ctx.document_type
+                if doc_type not in type_performance:
+                    type_performance[doc_type] = {"total": 0, "completed": 0, "failed": 0}
+                
+                type_performance[doc_type]["total"] += 1
+                if ctx.processing_status == ProcessingStatus.COMPLETED:
+                    type_performance[doc_type]["completed"] += 1
+                elif ctx.processing_status == ProcessingStatus.FAILED:
+                    type_performance[doc_type]["failed"] += 1
+        
+        # Sort by success rate
+        sorted_types = sorted(
+            type_performance.items(),
+            key=lambda x: (x[1]["completed"] / x[1]["total"]) if x[1]["total"] > 0 else 0,
+            reverse=True
+        )
+        
+        for doc_type, stats in sorted_types:
+            if stats["total"] > 0:
+                success_rate = (stats["completed"] / stats["total"]) * 100
+                lines.append(f"**{doc_type.title()} Documents**:")
+                lines.append(f"- Success Rate: {success_rate:.1f}% ({stats['completed']}/{stats['total']})")
+                lines.append("")
+        
+        return lines
+    
+    def _analyze_retry_patterns(self) -> List[str]:
+        """Analyze retry patterns and error types."""
+        lines = []
+        lines.append("## Retry and Error Analysis")
+        lines.append("")
+        
+        error_types = {}
+        retry_stats = {"no_retries": 0, "1_retry": 0, "2_retries": 0, "3_plus_retries": 0}
+        total_retries = 0
+        
+        for ctx in self.document_contexts.values():
+            # Count retry patterns
+            if ctx.retry_count == 0:
+                retry_stats["no_retries"] += 1
+            elif ctx.retry_count == 1:
+                retry_stats["1_retry"] += 1
+            elif ctx.retry_count == 2:
+                retry_stats["2_retries"] += 1
+            else:
+                retry_stats["3_plus_retries"] += 1
+            
+            total_retries += ctx.retry_count
+            
+            # Count error types
+            if ctx.last_error_type:
+                error_type = ctx.last_error_type.value
+                error_types[error_type] = error_types.get(error_type, 0) + 1
+        
+        lines.append("**Retry Distribution**:")
+        for retry_category, count in retry_stats.items():
+            lines.append(f"- {retry_category.replace('_', ' ').title()}: {count} documents")
+        lines.append(f"- Total Retries: {total_retries}")
+        lines.append("")
+        
+        if error_types:
+            lines.append("**Most Common Error Types**:")
+            sorted_errors = sorted(error_types.items(), key=lambda x: x[1], reverse=True)
+            for error_type, count in sorted_errors[:5]:  # Top 5 errors
+                lines.append(f"- {error_type}: {count} occurrences")
+            lines.append("")
+        
+        return lines
+    
+    def _generate_performance_recommendations(self, success_rate: float, total_docs: int, 
+                                           failed_docs: int, quarantined_docs: int,
+                                           quality_metrics: List[str], 
+                                           type_performance: List[str]) -> List[str]:
+        """Generate performance improvement recommendations."""
+        recommendations = []
+        
+        # Success rate recommendations
+        if success_rate < 70:
+            recommendations.append("🔴 Low success rate detected - consider using --quality-threshold to filter problematic documents")
+        
+        if failed_docs > total_docs * 0.2:
+            recommendations.append("🟠 High failure rate - consider using --skip-failed to avoid retry overhead")
+        
+        if quarantined_docs > 0:
+            recommendations.append(f"⚠️ {quarantined_docs} documents quarantined - review quarantine reasons and consider document preprocessing")
+        
+        # Rate limit recommendations
+        if self.batch_progress.rate_limit_hits > 5:
+            recommendations.append("🐌 Multiple rate limits hit - consider reducing batch size or increasing delays")
+        
+        # Processing speed recommendations
+        if self.batch_progress.documents_per_minute < 2:
+            recommendations.append("⏱️ Slow processing speed - consider using --fast-mode or --adaptive-batching")
+        
+        # Quality-based recommendations
+        low_quality_count = len([ctx for ctx in self.document_contexts.values() 
+                               if hasattr(ctx, 'quality_score') and ctx.quality_score < 0.4])
+        if low_quality_count > total_docs * 0.3:
+            recommendations.append("📉 Many low-quality documents - consider preprocessing or quality filtering")
+        
+        # Token efficiency
+        if self.batch_progress.time_per_token > 0.01:  # >10ms per token
+            recommendations.append("🔢 High time per token - consider optimizing document preprocessing")
+        
+        if not recommendations:
+            recommendations.append("✅ Performance looks good! No major issues detected.")
+        
+        return recommendations
