@@ -12,5 +12,7 @@ from .processor import TextProcessor
 from .analyzer import KnowledgeAnalyzer
 from .claude_integration import ClaudeIntegration
 from .semantic_analyzer import SemanticAnalyzer
+from .exporters.export_manager import ExportManager
+from .exporters.batch_exporter import BatchExporter
 
-__all__ = ["PDFExtractor", "TextProcessor", "KnowledgeAnalyzer", "ClaudeIntegration", "SemanticAnalyzer"]
+__all__ = ["PDFExtractor", "TextProcessor", "KnowledgeAnalyzer", "ClaudeIntegration", "SemanticAnalyzer", "ExportManager", "BatchExporter"]

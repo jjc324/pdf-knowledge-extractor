@@ -14,6 +14,7 @@ from typing import Optional, Dict
 from . import PDFExtractor, TextProcessor, KnowledgeAnalyzer
 from .utils import load_config, setup_logging
 from .claude_integration import ClaudeIntegration
+from .exporters.export_manager import ExportManager
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -260,7 +261,30 @@ Examples:
     
     parser.add_argument(
         "--export-formats",
-        help="Comma-separated list of export formats: graphml,json,gexf,html (default: json)"
+        help="Comma-separated list of export formats: obsidian,notion,roam,latex,anki,csv,excel,json-ld,rdf,confluence,teams (default: json)"
+    )
+    
+    parser.add_argument(
+        "--export-all",
+        action="store_true",
+        help="Export to all supported formats"
+    )
+    
+    parser.add_argument(
+        "--export-category",
+        choices=["knowledge-management", "academic", "learning", "enterprise", "data-analysis"],
+        help="Export to all formats in a specific category"
+    )
+    
+    parser.add_argument(
+        "--export-profile",
+        help="Use a predefined export profile"
+    )
+    
+    parser.add_argument(
+        "--list-export-formats",
+        action="store_true",
+        help="List all available export formats"
     )
     
     parser.add_argument(
@@ -710,6 +734,76 @@ def handle_semantic_analysis(args, config: Dict, logger, processable_pdfs_file: 
         # Generate summary report
         generate_semantic_summary_report(results, output_dir / "semantic_summary.md", logger)
         
+        # Handle universal export requests
+        export_manager = ExportManager()
+        export_data = {
+            'semantic_analysis': results,
+            'individual_analyses': {}  # Would need to be populated from actual document analyses
+        }
+        
+        # Populate individual analyses if available
+        for doc_id in documents.keys():
+            # This is a simplified version - in practice you'd have the actual analysis results
+            export_data['individual_analyses'][doc_id] = {
+                'word_count': len(documents[doc_id].split()),
+                'character_count': len(documents[doc_id]),
+                'topics': [],
+                'entities': [],
+                'sentiment': {'sentiment': 'neutral', 'score': 0.0}
+            }
+        
+        if args.export_all:
+            logger.info("Exporting to all supported formats...")
+            batch_result = export_manager.export_batch(
+                formats=list(export_manager.batch_exporter.EXPORTERS.keys()),
+                analysis_data=export_data,
+                documents=documents,
+                output_directory=output_dir / "exports"
+            )
+            logger.info(f"Batch export completed: {batch_result.successful_exports}/{batch_result.total_exports} successful")
+            
+        elif args.export_category:
+            logger.info(f"Exporting to {args.export_category} formats...")
+            batch_result = export_manager.batch_exporter.export_by_category(
+                category=args.export_category,
+                analysis_data=export_data,
+                documents=documents
+            )
+            logger.info(f"Category export completed: {batch_result.successful_exports}/{batch_result.total_exports} successful")
+            
+        elif args.export_profile:
+            logger.info(f"Exporting using profile: {args.export_profile}")
+            batch_result = export_manager.export_by_profile(
+                profile_name=args.export_profile,
+                analysis_data=export_data,
+                documents=documents,
+                output_directory=output_dir / "exports"
+            )
+            logger.info(f"Profile export completed: {batch_result.successful_exports}/{batch_result.total_exports} successful")
+            
+        elif args.export_formats:
+            export_formats_list = [f.strip() for f in args.export_formats.split(',')]
+            # Filter out legacy formats that are handled differently
+            new_formats = [f for f in export_formats_list if f not in ['graphml', 'gexf']]
+            legacy_formats = [f for f in export_formats_list if f in ['graphml', 'gexf']]
+            
+            if new_formats:
+                logger.info(f"Exporting to formats: {', '.join(new_formats)}")
+                batch_result = export_manager.export_batch(
+                    formats=new_formats,
+                    analysis_data=export_data,
+                    documents=documents,
+                    output_directory=output_dir / "exports"
+                )
+                logger.info(f"Export completed: {batch_result.successful_exports}/{batch_result.total_exports} successful")
+            
+            # Handle legacy knowledge graph formats
+            if legacy_formats and args.knowledge_graph:
+                for format_type in legacy_formats:
+                    graph_file = output_dir / f"knowledge_graph.{format_type}"
+                    semantic_analyzer.export_knowledge_graph(graph_file, format_type)
+                    logger.info(f"Knowledge graph exported to: {graph_file}")
+        
         # Print summary
         logger.info("\n" + "="*60)
         logger.info("SEMANTIC ANALYSIS COMPLETE")
@@ -998,6 +1092,21 @@ def main() -> int:
     logger = logging.getLogger(__name__)
     
     try:
+        # Handle list export formats request
+        if args.list_export_formats:
+            export_manager = ExportManager()
+            formats = export_manager.get_supported_formats()
+            
+            print("Available Export Formats:")
+            print("=" * 50)
+            for category, format_list in formats.items():
+                print(f"\n{category}:")
+                for fmt in format_list:
+                    description = export_manager.batch_exporter.__class__.get_format_description(fmt)
+                    print(f"  {fmt:<20} - {description}")
+            
+            return 0
+        
         # Load configuration
         config = {}
         if Path(args.config).exists():
